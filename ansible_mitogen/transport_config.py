@@ -99,6 +99,9 @@ def run_interpreter_discovery_if_necessary(s, task_vars, action, rediscover_pyth
         interpreter_name = 'python'
         discovered_interpreter_config = u'discovered_interpreter_%s' % interpreter_name
         
+        if task_vars.get('ansible_delegated_vars', False):
+           rediscover_python=True
+
         if task_vars.get('ansible_facts') is None:
            task_vars['ansible_facts'] = {}
 
