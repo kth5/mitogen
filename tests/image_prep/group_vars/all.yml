@@ -1,8 +1,13 @@
+ansible_version_major_minor: "{{ ansible_version.major }}.{{ ansible_version.minor }}"
+
 common_packages:
   - openssh-server
   - rsync
   - strace
   - sudo
+
+container_image_name: "{{ container_registry }}/{{ inventory_hostname }}-test"
+container_registry: public.ecr.aws/n5z0e8q9
 
 sudo_group:
   MacOSX: admin

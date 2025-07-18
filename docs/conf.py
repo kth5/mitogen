@@ -1,10 +1,24 @@
-import os
+import re
 import sys
 
-sys.path.append('..')
 sys.path.append('.')
-import mitogen
-VERSION = '%s.%s.%s' % mitogen.__version__
+
+
+def changelog_version(path, encoding='utf-8'):
+    "Return the 1st *stable* (not pre, dev) version in the changelog"
+    # See also grep_version() in setup.py
+    # e.g. "0.1.2, (1999-12-31)\n"
+    version_pattern = re.compile(
+        r'^v(?P<version>\d+\.\d+\.\d+) \((?P<date>\d\d\d\d-\d\d-\d\d)\)$',
+        re.MULTILINE,
+    )
+
+    with open(path, encoding=encoding) as f:
+        match = version_pattern.search(f.read())
+        return match.group('version')
+
+
+VERSION = changelog_version('changelog.rst')
 
 author = u'Network Genomics'
 copyright = u'2021, the Mitogen authors'
@@ -18,7 +32,6 @@ html_show_copyright = False
 html_show_sourcelink = False
 html_show_sphinx = False
 html_sidebars = {'**': ['globaltoc.html', 'github.html']}
-html_additional_pages = {'ansible': 'ansible.html'}
 html_static_path = ['_static']
 html_theme = 'alabaster'
 html_theme_options = {
@@ -44,16 +57,25 @@ version = VERSION
 domainrefs = {
     'gh:commit': {
         'text': '%s',
-        'url': 'https://github.com/dw/mitogen/commit/%s',
+        'url': 'https://github.com/mitogen-hq/mitogen/commit/%s',
     },
     'gh:issue': {
         'text': '#%s',
-        'url': 'https://github.com/dw/mitogen/issues/%s',
+        'url': 'https://github.com/mitogen-hq/mitogen/issues/%s',
     },
     'gh:pull': {
         'text': '#%s',
-        'url': 'https://github.com/dw/mitogen/pull/%s',
+        'url': 'https://github.com/mitogen-hq/mitogen/pull/%s',
     },
+    'gh:ansissue': {
+        'text': 'Ansible #%s',
+        'url': 'https://github.com/ansible/ansible/issues/%s',
+    },
+    'gh:anspull': {
+        'text': 'Ansible #%s',
+        'url': 'https://github.com/ansible/ansible/pull/%s',
+    },
+
     'ans:mod': {
         'text': '%s module',
         'url': 'https://docs.ansible.com/ansible/latest/modules/%s_module.html',
@@ -64,30 +86,36 @@ domainrefs = {
     },
     'freebsd:man2': {
         'text': '%s(2)',
-        'url': 'https://www.freebsd.org/cgi/man.cgi?query=%s',
+        'url': 'https://man.freebsd.org/cgi/man.cgi?query=%s',
     },
     'linux:man1': {
         'text': '%s(1)',
-        'url': 'http://man7.org/linux/man-pages/man1/%s.1.html',
+        'url': 'https://man7.org/linux/man-pages/man1/%s.1.html',
     },
     'linux:man2': {
         'text': '%s(2)',
-        'url': 'http://man7.org/linux/man-pages/man2/%s.2.html',
+        'url': 'https://man7.org/linux/man-pages/man2/%s.2.html',
     },
     'linux:man3': {
         'text': '%s(3)',
-        'url': 'http://man7.org/linux/man-pages/man3/%s.3.html',
+        'url': 'https://man7.org/linux/man-pages/man3/%s.3.html',
     },
     'linux:man7': {
         'text': '%s(7)',
-        'url': 'http://man7.org/linux/man-pages/man7/%s.7.html',
+        'url': 'https://man7.org/linux/man-pages/man7/%s.7.html',
     },
 }
 
+# > ## Official guidance
+# > Query PyPI’s JSON API to determine where to download files from.
+# > ## Predictable URLs
+# > You can use our conveyor service to fetch this file, which exists for
+# > cases where using the API is impractical or impossible.
+# > -- https://warehouse.pypa.io/api-reference/integration-guide.html#predictable-urls
 rst_epilog = """
 
 .. |mitogen_version| replace:: %(VERSION)s
 
-.. |mitogen_url| replace:: `mitogen-%(VERSION)s.tar.gz <https://networkgenomics.com/try/mitogen-%(VERSION)s.tar.gz>`__
+.. |mitogen_url| replace:: `mitogen-%(VERSION)s.tar.gz <https://files.pythonhosted.org/packages/source/m/mitogen/mitogen-%(VERSION)s.tar.gz>`__
 
 """ % locals()

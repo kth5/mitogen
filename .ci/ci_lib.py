@@ -10,7 +10,10 @@ import shutil
 import sys
 import tempfile
 
-import subprocess32 as subprocess
+if sys.version_info < (3, 0):
+    import subprocess32 as subprocess
+else:
+    import subprocess
 
 try:
     import urlparse
@@ -24,6 +27,23 @@ os.chdir(
     )
 )
 
+
+GIT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+ANSIBLE_TESTS_DIR = os.path.join(GIT_ROOT, 'tests/ansible')
+ANSIBLE_TESTS_HOSTS_DIR = os.path.join(GIT_ROOT, 'tests/ansible/hosts')
+ANSIBLE_TESTS_TEMPLATES_DIR = os.path.join(GIT_ROOT, 'tests/ansible/templates')
+DISTRO_SPECS = os.environ.get(
+    'MITOGEN_TEST_DISTRO_SPECS',
+    'centos6 centos8 debian9 debian11 ubuntu1604 ubuntu2004',
+)
+IMAGE_PREP_DIR = os.path.join(GIT_ROOT, 'tests/image_prep')
+IMAGE_TEMPLATE = os.environ.get(
+    'MITOGEN_TEST_IMAGE_TEMPLATE',
+    'ghcr.io/mitogen-hq/%(distro)s-test:2021',
+)
+TESTS_SSH_PRIVATE_KEY_FILE = os.path.join(GIT_ROOT, 'tests/data/docker/mitogen__has_sudo_pubkey.key')
+
+
 _print = print
 def print(*args, **kwargs):
     file = kwargs.get('file', sys.stdout)
@@ -34,6 +54,7 @@ def print(*args, **kwargs):
 
 
 def _have_cmd(args):
+    # Code duplicated in testlib.py
     try:
         subprocess.run(
             args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -42,17 +63,9 @@ def _have_cmd(args):
         if exc.errno == errno.ENOENT:
             return False
         raise
-    except subprocess.CallProcessError:
+    except subprocess.CalledProcessError:
         return False
     return True
-
-
-def have_apt():
-    return _have_cmd(['apt', '--help'])
-
-
-def have_brew():
-    return _have_cmd(['brew', 'help'])
 
 
 def have_docker():
@@ -171,8 +184,8 @@ def exists_in_path(progname):
 
 
 class TempDir(object):
-    def __init__(self):
-        self.path = tempfile.mkdtemp(prefix='mitogen_ci_lib')
+    def __init__(self, prefix='mitogen_ci_lib'):
+        self.path = tempfile.mkdtemp(prefix=prefix)
         atexit.register(self.destroy)
 
     def destroy(self, rmtree=shutil.rmtree):
@@ -185,26 +198,6 @@ class Fold(object):
     def __exit__(self, _1, _2, _3): pass
 
 
-GIT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-# Used only when MODE=mitogen
-DISTRO = os.environ.get('DISTRO', 'debian9')
-# Used only when MODE=ansible
-DISTROS = os.environ.get('DISTROS', 'centos6 centos8 debian9 debian11 ubuntu1604 ubuntu2004').split()
-TARGET_COUNT = int(os.environ.get('TARGET_COUNT', '2'))
-BASE_PORT = 2200
-TMP = TempDir().path
-
-
-# We copy this out of the way to avoid random stuff modifying perms in the Git
-# tree (like git pull).
-src_key_file = os.path.join(GIT_ROOT,
-    'tests/data/docker/mitogen__has_sudo_pubkey.key')
-key_file = os.path.join(TMP,
-    'mitogen__has_sudo_pubkey.key')
-shutil.copyfile(src_key_file, key_file)
-os.chmod(key_file, int('0600', 8))
-
-
 os.environ['PYTHONDONTWRITEBYTECODE'] = 'x'
 os.environ['PYTHONPATH'] = '%s:%s' % (
     os.environ.get('PYTHONPATH', ''),
@@ -214,6 +207,7 @@ os.environ['PYTHONPATH'] = '%s:%s' % (
 def get_docker_hostname():
     """Return the hostname where the docker daemon is running.
     """
+    # Duplicated in testlib
     url = os.environ.get('DOCKER_HOST')
     if url in (None, 'http+docker://localunixsocket'):
         return 'localhost'
@@ -222,27 +216,34 @@ def get_docker_hostname():
     return parsed.netloc.partition(':')[0]
 
 
-def make_containers(name_prefix='', port_offset=0):
+def container_specs(
+        distros,
+        base_port=2200,
+        image_template=IMAGE_TEMPLATE,
+        name_template='target-%(distro)s-%(index)d',
+):
     """
     >>> import pprint
-    >>> BASE_PORT=2200; DISTROS=['debian11', 'centos6']
-    >>> pprint.pprint(make_containers())
+    >>> pprint.pprint(container_specs(['debian11-py3', 'centos6']))
     [{'distro': 'debian11',
       'family': 'debian',
       'hostname': 'localhost',
-      'image': 'public.ecr.aws/n5z0e8q9/debian11-test',
+      'image': 'ghcr.io/mitogen-hq/debian11-test:2021',
+      'index': 1,
       'name': 'target-debian11-1',
       'port': 2201,
-      'python_path': '/usr/bin/python'},
+      'python_path': '/usr/bin/python3'},
      {'distro': 'centos6',
       'family': 'centos',
       'hostname': 'localhost',
-      'image': 'public.ecr.aws/n5z0e8q9/centos6-test',
+      'image': 'ghcr.io/mitogen-hq/centos6-test:2021',
+      'index': 2,
       'name': 'target-centos6-2',
       'port': 2202,
       'python_path': '/usr/bin/python'}]
     """
     docker_hostname = get_docker_hostname()
+    # Code duplicated in testlib.py, both should be updated together
     distro_pattern = re.compile(r'''
         (?P<distro>(?P<family>[a-z]+)[0-9]+)
         (?:-(?P<py>py3))?
@@ -253,30 +254,27 @@ def make_containers(name_prefix='', port_offset=0):
     i = 1
     lst = []
 
-    for distro in DISTROS:
+    for distro in distros:
+        # Code duplicated in testlib.py, both should be updated together
         d = distro_pattern.match(distro).groupdict(default=None)
-        distro = d['distro']
-        family = d['family']
-        image = 'public.ecr.aws/n5z0e8q9/%s-test' % (distro,)
 
-        if d['py'] == 'py3':
+        if d.pop('py') == 'py3':
             python_path = '/usr/bin/python3'
         else:
             python_path = '/usr/bin/python'
 
-        if d['count']:
-            count = int(count)
-        else:
-            count = 1
+        count = int(d.pop('count') or '1', 10)
 
         for x in range(count):
-            lst.append({
-                "distro": distro, "family": family, "image": image,
-                "name": name_prefix + ("target-%s-%s" % (distro, i)),
+            d['index'] = i
+            d.update({
+                'image': image_template % d,
+                'name': name_template % d,
                 "hostname": docker_hostname,
-                "port": BASE_PORT + i + port_offset,
+                'port': base_port + i,
                 "python_path": python_path,
             })
+            lst.append(d)
             i += 1
 
     return lst

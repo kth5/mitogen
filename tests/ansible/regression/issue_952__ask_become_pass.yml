@@ -1,0 +1,26 @@
+- name: regression/issue_952__ask_become_pass.yml
+  hosts: test-targets[0]:&linux_containers
+  gather_facts: false
+  tags:
+    - issue_952
+  tasks:
+    - name: Test --ask-become-pass
+      delegate_to: localhost
+      vars:
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+      environment:
+        ANSIBLE_STRATEGY:  "{{ lookup('env', 'ANSIBLE_STRATEGY') | mandatory }}"
+        ANSIBLE_VERBOSITY: "{{ ansible_verbosity }}"
+      expect:
+        command: >
+          ansible-playbook
+          {% for inv in ansible_inventory_sources %}
+          -i "{{ inv }}"
+          {% endfor %}
+          --ask-become-pass
+          regression/become_test.yml
+        chdir: ../
+        responses:
+          'BECOME password:': pw_required_password
+      changed_when: false
+      check_mode: false

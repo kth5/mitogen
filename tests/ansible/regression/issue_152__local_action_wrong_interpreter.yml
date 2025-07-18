@@ -4,11 +4,12 @@
 # can test for.
 
 - name: regression/issue_152__local_action_wrong_interpreter.yml
-  hosts: test-targets
+  hosts: test-targets[0]
   connection: local
   tasks:
-
     - name: Create /tmp/issue_152_interpreter.sh
+      vars:
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
       copy:
         dest: /tmp/issue_152_interpreter.sh
         mode: u+x
@@ -25,9 +26,12 @@
     - assert:
         that:
           - out.env.CUSTOM_INTERPRETER == "1"
-        fail_msg: out={{out}}
+        fail_msg: |
+          out={{ out }}
 
     - name: Cleanup /tmp/issue_152_interpreter.sh
+      vars:
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
       file:
         path: /tmp/issue_152_interpreter.sh
         state: absent

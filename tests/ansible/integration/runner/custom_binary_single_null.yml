@@ -15,7 +15,9 @@
       that:
       - "out.failed"
       - "out.results[0].failed"
-      - "out.results[0].msg.startswith('MODULE FAILURE')"
+      - |
+        out.results[0].msg.startswith('MODULE FAILURE')
+        or out.results[0].msg == 'Module result deserialization failed: No start of json char found'
       # On Ubuntu 16.04 /bin/sh is dash 0.5.8. It treats custom_binary_single_null
       # as a valid executable. There's no error message, and rc == 0.
       - |
@@ -28,7 +30,8 @@
           'custom_binary_single_null: cannot execute binary file: Exec format error\r\n',
         ))
         or (ansible_facts.distribution == 'Ubuntu' and ansible_facts.distribution_version == '16.04')
-      fail_msg: out={{out}}
+      fail_msg: |
+        out={{ out }}
   tags:
     - custom_binary_single_null
 

@@ -50,12 +50,15 @@ import threading
 
 import ansible.constants
 
+from ansible.module_utils.six import reraise
+
 import mitogen.core
 import mitogen.service
-import mitogen.utils
 import ansible_mitogen.loaders
 import ansible_mitogen.module_finder
 import ansible_mitogen.target
+import ansible_mitogen.utils
+import ansible_mitogen.utils.unsafe
 
 
 LOG = logging.getLogger(__name__)
@@ -64,20 +67,6 @@ LOG = logging.getLogger(__name__)
 # during module import to ensure a single-threaded environment; PluginLoader
 # is not thread-safe.
 ansible_mitogen.loaders.shell_loader.get('sh')
-
-
-if sys.version_info[0] == 3:
-    def reraise(tp, value, tb):
-        if value is None:
-            value = tp()
-        if value.__traceback__ is not tb:
-            raise value.with_traceback(tb)
-        raise value
-else:
-    exec(
-        "def reraise(tp, value, tb=None):\n"
-        "    raise tp, value, tb\n"
-     )
 
 
 def _get_candidate_temp_dirs():
@@ -91,7 +80,7 @@ def _get_candidate_temp_dirs():
         remote_tmp = ansible.constants.DEFAULT_REMOTE_TMP
         system_tmpdirs = ('/var/tmp', '/tmp')
 
-    return mitogen.utils.cast([remote_tmp] + list(system_tmpdirs))
+    return ansible_mitogen.utils.unsafe.cast([remote_tmp] + list(system_tmpdirs))
 
 
 def key_from_dict(**kwargs):
@@ -350,7 +339,12 @@ class ContextService(mitogen.service.Service):
         'ansible_mitogen.target',
         'mitogen.fork',
         'mitogen.service',
-    )
+    ) + ((
+        'ansible.module_utils._internal._json._profiles._module_legacy_c2m',
+        'ansible.module_utils._internal._json._profiles._module_legacy_m2c',
+        'ansible.module_utils._internal._json._profiles._module_modern_c2m',
+        'ansible.module_utils._internal._json._profiles._module_legacy_m2c',
+    ) if ansible_mitogen.utils.ansible_version[:2] >= (2, 19) else ())
 
     def _send_module_forwards(self, context):
         if hasattr(self.router.responder, 'forward_modules'):

@@ -3,23 +3,24 @@
   hosts: test-targets
   gather_facts: false
   tasks:
-  - meta: end_play
-    when: not is_mitogen
+  - include_tasks: ../_mitogen_only.yml
 
   - meta: end_play
     when:
-      - ansible_version.full is version('2.5', '<', strict=True)
+      - ansible_version_major_minor is version('2.5', '<', strict=True)
 
   - custom_python_detect_environment:
     vars:
       ansible_connection: kubectl
-      ansible_python_interpreter: python  # avoid Travis virtualenv breakage
+      ansible_python_interpreter: "{{ ansible_playbook_python }}"
       mitogen_kubectl_path: stub-kubectl.py
     register: out
 
   - assert:
       that:
       - out.env.THIS_IS_STUB_KUBECTL == '1'
-      fail_msg: out={{out}}
+      fail_msg: |
+        out={{ out }}
   tags:
     - kubectl
+    - mitogen_only

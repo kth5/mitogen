@@ -1,2 +1,36 @@
 ---
+# Avoid `ansible_version.full is version(..., strict=True)` limitations.
+# Pre-release info (alpha/beta/rc) is intentionally ignored.
+# Behaviour that is present or expected in ansible-core 2.50.x should be
+# tested even if ansible-core 2.50.0a1 or 2.50.0rc1 is under test.
+ansible_version_major_minor: "{{ ansible_version.major }}.{{ ansible_version.minor }}"
+ansible_version_major_minor_patch: "{{ ansible_version.major }}.{{ ansible_version.minor }}.{{ ansible_version.revision | regex_search('^[0-9]+') }}"
+
+become_unpriv_available: >-
+  {#
+    Vanilla Ansible >= 4 (ansible-core >= 2.11) can use `setfacl` for
+    unpriv -> unpriv, but Mitogen test containers lack setfacl
+    https://github.com/mitogen-hq/mitogen/issues/1118
+
+    Mitogen + Ansible can do unpriv -> unpriv without temporary files,
+    but Ansible >= 11 (ansible-core >= 2.18) detection tries to use Python
+    3.13 which hits https://github.com/python/cpython/issues/115911 on macOS.
+  #}
+  {{-
+    (
+      not is_mitogen
+      and is_macos_controller
+      and ansible_version_major_minor is version("2.11", ">=", strict=True)
+    )
+    or (
+      is_mitogen
+      and not is_macos_controller
+    )
+    or (
+      is_mitogen
+      and ansible_python_interpreter is not defined
+      and ansible_version_major_minor is version("2.18", "<", strict=True)
+    )
+  -}}
+
 pkg_mgr_python_interpreter: python

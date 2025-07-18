@@ -39,8 +39,10 @@ __metaclass__ = type
 import errno
 import grp
 import json
+import logging
 import operator
 import os
+import pty
 import pwd
 import re
 import signal
@@ -51,26 +53,9 @@ import tempfile
 import traceback
 import types
 
-# Absolute imports for <2.5.
-logging = __import__('logging')
-
 import mitogen.core
 import mitogen.parent
 import mitogen.service
-from mitogen.core import b
-
-try:
-    reduce
-except NameError:
-    # Python 3.x.
-    from functools import reduce
-
-try:
-    BaseException
-except NameError:
-    # Python 2.4
-    BaseException = Exception
-
 
 # Ansible since PR #41749 inserts "import __main__" into
 # ansible.module_utils.basic. Mitogen's importer will refuse such an import, so
@@ -80,6 +65,9 @@ if not sys.modules.get(str('__main__')):
     sys.modules[str('__main__')] = types.ModuleType(str('__main__'))
 
 import ansible.module_utils.json_utils
+
+from ansible.module_utils.six.moves import reduce
+
 import ansible_mitogen.runner
 
 
@@ -133,7 +121,7 @@ def subprocess__Popen__close_fds(self, but):
             continue
 
         fd = int(name, 10)
-        if fd > 2 and fd != but:
+        if fd > pty.STDERR_FILENO and fd != but:
             try:
                 os.close(fd)
             except OSError:
@@ -615,8 +603,8 @@ def exec_args(args, in_data='', chdir=None, shell=None, emulate_tty=False):
     stdout, stderr = proc.communicate(in_data)
 
     if emulate_tty:
-        stdout = stdout.replace(b('\n'), b('\r\n'))
-    return proc.returncode, stdout, stderr or b('')
+        stdout = stdout.replace(b'\n', b'\r\n')
+    return proc.returncode, stdout, stderr or b''
 
 
 def exec_command(cmd, in_data='', chdir=None, shell=None, emulate_tty=False):
@@ -660,11 +648,10 @@ def set_file_owner(path, owner, group=None, fd=None):
     else:
         gid = os.getegid()
 
-    if fd is not None and hasattr(os, 'fchown'):
-        os.fchown(fd, (uid, gid))
+    if fd is not None:
+        os.fchown(fd, uid, gid)
     else:
-        # Python<2.6
-        os.chown(path, (uid, gid))
+        os.chown(path, uid, gid)
 
 
 def write_path(path, s, owner=None, group=None, mode=None,
@@ -746,9 +733,7 @@ def set_file_mode(path, spec, fd=None):
     """
     Update the permissions of a file using the same syntax as chmod(1).
     """
-    if isinstance(spec, int):
-        new_mode = spec
-    elif not mitogen.core.PY3 and isinstance(spec, long):
+    if isinstance(spec, mitogen.core.integer_types):
         new_mode = spec
     elif spec.isdigit():
         new_mode = int(spec, 8)
@@ -756,7 +741,7 @@ def set_file_mode(path, spec, fd=None):
         mode = os.stat(path).st_mode
         new_mode = apply_mode_spec(spec, mode)
 
-    if fd is not None and hasattr(os, 'fchmod'):
+    if fd is not None:
         os.fchmod(fd, new_mode)
     else:
         os.chmod(path, new_mode)

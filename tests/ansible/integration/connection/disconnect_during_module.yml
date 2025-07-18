@@ -6,11 +6,15 @@
   gather_facts: no
   any_errors_fatal: false
   tasks:
-  - meta: end_play
-    when: not is_mitogen
+  - include_tasks: ../_mitogen_only.yml
 
   - name: Run _disconnect_during_module.yml
     delegate_to: localhost
+    vars:
+      ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    environment:
+      ANSIBLE_STRATEGY:  "{{ lookup('env', 'ANSIBLE_STRATEGY') | mandatory }}"
+      ANSIBLE_VERBOSITY: "{{ ansible_verbosity }}"
     command: |
       ansible-playbook
       {% for inv in ansible_inventory_sources %}
@@ -28,7 +32,9 @@
       that:
       - out.rc == 4
       - "'Mitogen was disconnected from the remote environment while a call was in-progress.' in out.stdout"
-      fail_msg: out={{out}}
+      fail_msg: |
+        out={{ out }}
   tags:
     - disconnect
     - disconnect_during_module
+    - mitogen_only

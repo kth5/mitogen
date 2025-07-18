@@ -61,10 +61,9 @@ import mitogen.utils
 import ansible
 import ansible.constants as C
 import ansible.errors
+
 import ansible_mitogen.logging
 import ansible_mitogen.services
-
-from mitogen.core import b
 import ansible_mitogen.affinity
 
 
@@ -281,11 +280,11 @@ def get_cpu_count(default=None):
 
 class Broker(mitogen.master.Broker):
     """
-    WorkerProcess maintains at most 2 file descriptors, therefore does not need
+    WorkerProcess maintains fewer file descriptors, therefore does not need
     the exuberant syscall expense of EpollPoller, so override it and restore
     the poll() poller.
     """
-    poller_class = mitogen.core.Poller
+    poller_class = mitogen.parent.POLLER_LIGHTWEIGHT
 
 
 class Binding(object):
@@ -639,7 +638,7 @@ class MuxProcess(object):
 
         try:
             # Let the parent know our listening socket is ready.
-            mitogen.core.io_op(self.model.child_sock.send, b('1'))
+            mitogen.core.io_op(self.model.child_sock.send, b'1')
             # Block until the socket is closed, which happens on parent exit.
             mitogen.core.io_op(self.model.child_sock.recv, 1)
         finally:

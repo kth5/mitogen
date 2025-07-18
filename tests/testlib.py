@@ -18,7 +18,10 @@ except ImportError:
     import ConfigParser as configparser
 
 import psutil
-import subprocess32 as subprocess
+if sys.version_info < (3, 0):
+    import subprocess32 as subprocess
+else:
+    import subprocess
 
 import mitogen.core
 import mitogen.fork
@@ -47,8 +50,22 @@ except NameError:
 
 
 LOG = logging.getLogger(__name__)
-DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
-MODS_DIR = os.path.join(DATA_DIR, 'importer')
+
+DISTRO_SPECS = os.environ.get(
+    'MITOGEN_TEST_DISTRO_SPECS',
+    'centos6 centos8 debian9 debian11 ubuntu1604 ubuntu2004',
+)
+IMAGE_TEMPLATE = os.environ.get(
+    'MITOGEN_TEST_IMAGE_TEMPLATE',
+    'ghcr.io/mitogen-hq/%(distro)s-test:2021',
+)
+
+TESTS_DIR =                     os.path.join(os.path.dirname(__file__))
+ANSIBLE_LIB_DIR =               os.path.join(TESTS_DIR, 'ansible', 'lib')
+ANSIBLE_MODULE_UTILS_DIR =      os.path.join(TESTS_DIR, 'ansible', 'lib', 'module_utils')
+ANSIBLE_MODULES_DIR =           os.path.join(TESTS_DIR, 'ansible', 'lib', 'modules')
+DATA_DIR =                      os.path.join(TESTS_DIR, 'data')
+MODS_DIR =                      os.path.join(TESTS_DIR, 'data', 'importer')
 
 sys.path.append(DATA_DIR)
 sys.path.append(MODS_DIR)
@@ -87,7 +104,7 @@ def base_executable(executable=None):
         base_executable = None
 
     if base_executable and base_executable != executable:
-        return 'be', base_executable
+        return base_executable
 
     # Python 2.x only has sys.base_prefix if running outside a virtualenv.
     try:
@@ -136,6 +153,40 @@ def data_path(suffix):
         # SSH is funny about private key permissions.
         os.chmod(path, int('0600', 8))
     return path
+
+
+def _have_cmd(args):
+    # Code duplicated in ci_lib.py
+    try:
+        subprocess.run(
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return False
+        raise
+    except subprocess.CalledProcessError:
+        return False
+    return True
+
+
+def have_python2():
+    return _have_cmd(['python2'])
+
+
+def have_python3():
+    return _have_cmd(['python3'])
+
+
+def retry(fn, on, max_attempts, delay):
+    for i in range(max_attempts):
+        try:
+            return fn()
+        except on:
+            if i >= max_attempts - 1:
+                raise
+            else:
+                time.sleep(delay)
 
 
 def threading__thread_is_alive(thread):
@@ -490,6 +541,7 @@ class TestCase(unittest.TestCase):
 
 
 def get_docker_host():
+    # Duplicated in ci_lib
     url = os.environ.get('DOCKER_HOST')
     if url in (None, 'http+docker://localunixsocket'):
         return 'localhost'
@@ -499,19 +551,18 @@ def get_docker_host():
 
 
 class DockerizedSshDaemon(object):
-    def _get_container_port(self):
-        s = subprocess.check_output(['docker', 'port', self.container_name])
-        for line in s.decode().splitlines():
-            m = self.PORT_RE.match(line)
-            if not m:
-                continue
-            dport, proto, _, bport = m.groups()
-            if dport == '22' and proto == 'tcp':
-                self.port = int(bport)
+    PORT_RE = re.compile(
+        # e.g. 0.0.0.0:32771, :::32771, [::]:32771'
+        r'(?P<addr>[0-9.]+|::|\[[a-f0-9:.]+\]):(?P<port>[0-9]+)',
+    )
 
-        self.host = self.get_host()
-        if self.port is None:
+    @classmethod
+    def get_port(cls, container):
+        s = subprocess.check_output(['docker', 'port', container, '22/tcp'])
+        m = cls.PORT_RE.search(s.decode())
+        if not m:
             raise ValueError('could not find SSH port in: %r' % (s,))
+        return int(m.group('port'))
 
     def start_container(self):
         try:
@@ -530,47 +581,52 @@ class DockerizedSshDaemon(object):
             self.image,
         ]
         subprocess.check_output(args)
-        self._get_container_port()
+        self.port = self.get_port(self.container_name)
 
-    def __init__(self, mitogen_test_distro=os.environ.get('MITOGEN_TEST_DISTRO', 'debian9')):
-        if '-'  in mitogen_test_distro:
-            distro, _py3 = mitogen_test_distro.split('-')
-        else:
-            distro = mitogen_test_distro
-            _py3 = None
+    def __init__(self, distro_spec, image_template=IMAGE_TEMPLATE):
+        # Code duplicated in ci_lib.py, both should be updated together
+        distro_pattern = re.compile(r'''
+            (?P<distro>(?P<family>[a-z]+)[0-9]+)
+            (?:-(?P<py>py3))?
+            (?:\*(?P<count>[0-9]+))?
+            ''',
+            re.VERBOSE,
+        )
+        d = distro_pattern.match(distro_spec).groupdict(default=None)
 
-        if _py3 == 'py3':
+        self.distro = d['distro']
+        self.family = d['family']
+
+        if d.pop('py') == 'py3':
             self.python_path = '/usr/bin/python3'
         else:
             self.python_path = '/usr/bin/python'
 
-        self.image = 'public.ecr.aws/n5z0e8q9/%s-test' % (distro,)
-
-        # 22/tcp -> 0.0.0.0:32771
-        self.PORT_RE = re.compile(r'([^/]+)/([^ ]+) -> ([^:]+):(.*)')
-        self.port = None
-
-        self.start_container()
-
-    def get_host(self):
-        return get_docker_host()
+        self.image = image_template % d
+        self.host = get_docker_host()
 
     def wait_for_sshd(self):
-        wait_for_port(self.get_host(), self.port, pattern='OpenSSH')
+        wait_for_port(self.host, self.port, pattern='OpenSSH')
 
     def check_processes(self):
-        args = ['docker', 'exec', self.container_name, 'ps', '-o', 'comm=']
+        # Get Accounting name (ucomm) & command line (args) of each process
+        # in the container. No truncation (-ww). No column headers (foo=).
+        ps_output = subprocess.check_output([
+            'docker', 'exec', self.container_name,
+            'ps', '-w', '-w', '-o', 'ucomm=', '-o', 'args=',
+        ])
+        ps_lines = ps_output.decode().splitlines()
+        processes = [tuple(line.split(None, 1)) for line in ps_lines]
         counts = {}
-        for comm in subprocess.check_output(args).decode().splitlines():
-            comm = comm.strip()
-            counts[comm] = counts.get(comm, 0) + 1
+        for ucomm, _ in processes:
+            counts[ucomm] = counts.get(ucomm, 0) + 1
 
         if counts != {'ps': 1, 'sshd': 1}:
             assert 0, (
                 'Docker container %r contained extra running processes '
                 'after test completed: %r' % (
                     self.container_name,
-                    counts
+                    processes,
                 )
             )
 
@@ -581,6 +637,9 @@ class DockerizedSshDaemon(object):
 
 class BrokerMixin(object):
     broker_class = mitogen.master.Broker
+
+    # Flag for tests that shutdown the broker themself
+    # e.g. unix_test.ListenerTest
     broker_shutdown = False
 
     def setUp(self):
@@ -617,26 +676,50 @@ class DockerMixin(RouterMixin):
         if os.environ.get('SKIP_DOCKER_TESTS'):
             raise unittest.SkipTest('SKIP_DOCKER_TESTS is set')
 
-        # we want to be able to override test distro for some tests that need a different container spun up
-        daemon_args = {}
-        if hasattr(cls, 'mitogen_test_distro'):
-            daemon_args['mitogen_test_distro'] = cls.mitogen_test_distro
-
-        cls.dockerized_ssh = DockerizedSshDaemon(**daemon_args)
+        # cls.dockerized_ssh is injected by dynamically generating TestCase
+        # subclasses.
+        # TODO Bite the bullet, switch to e.g. pytest
+        cls.dockerized_ssh.start_container()
         cls.dockerized_ssh.wait_for_sshd()
 
     @classmethod
     def tearDownClass(cls):
-        cls.dockerized_ssh.check_processes()
+        retry(
+            cls.dockerized_ssh.check_processes,
+            on=AssertionError,
+            max_attempts=5,
+            delay=0.1,
+        )
         cls.dockerized_ssh.close()
         super(DockerMixin, cls).tearDownClass()
 
+    @property
+    def docker_ssh_default_kwargs(self):
+        return {
+            'hostname': self.dockerized_ssh.host,
+            'port': self.dockerized_ssh.port,
+            'check_host_keys': 'ignore',
+            'ssh_debug_level': 3,
+            # https://www.openssh.com/legacy.html
+            # ssh-rsa uses SHA1. Least worst available with CentOS 7 sshd.
+            # Rejected by default in newer ssh clients (e.g. Ubuntu 22.04).
+            # Duplicated cases in
+            #   - tests/ansible/ansible.cfg
+            #   - tests/ansible/integration/connection_delegation/delegate_to_template.yml
+            #   - tests/ansible/integration/connection_delegation/stack_construction.yml
+            #   - tests/ansible/integration/process/unix_socket_cleanup.yml
+            #   - tests/ansible/integration/ssh/variables.yml
+            #   - tests/testlib.py
+            'ssh_args': [
+                '-o', 'HostKeyAlgorithms +ssh-rsa',
+                '-o', 'PubkeyAcceptedKeyTypes +ssh-rsa',
+            ],
+            'python_path': self.dockerized_ssh.python_path,
+        }
+
     def docker_ssh(self, **kwargs):
-        kwargs.setdefault('hostname', self.dockerized_ssh.host)
-        kwargs.setdefault('port', self.dockerized_ssh.port)
-        kwargs.setdefault('check_host_keys', 'ignore')
-        kwargs.setdefault('ssh_debug_level', 3)
-        kwargs.setdefault('python_path', self.dockerized_ssh.python_path)
+        for k, v in self.docker_ssh_default_kwargs.items():
+            kwargs.setdefault(k, v)
         return self.router.ssh(**kwargs)
 
     def docker_ssh_any(self, **kwargs):

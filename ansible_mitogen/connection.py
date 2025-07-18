@@ -43,7 +43,6 @@ import ansible.errors
 import ansible.plugins.connection
 
 import mitogen.core
-import mitogen.utils
 
 import ansible_mitogen.mixins
 import ansible_mitogen.parsing
@@ -51,6 +50,7 @@ import ansible_mitogen.process
 import ansible_mitogen.services
 import ansible_mitogen.target
 import ansible_mitogen.transport_config
+import ansible_mitogen.utils.unsafe
 
 
 LOG = logging.getLogger(__name__)
@@ -119,7 +119,7 @@ def _connect_ssh(spec):
     """
     Return ContextService arguments for an SSH connection.
     """
-    if C.HOST_KEY_CHECKING:
+    if spec.host_key_checking():
         check_host_keys = 'enforce'
     else:
         check_host_keys = 'ignore'
@@ -145,9 +145,9 @@ def _connect_ssh(spec):
             'identity_file': private_key_file,
             'identities_only': False,
             'ssh_path': spec.ssh_executable(),
-            'connect_timeout': spec.ansible_ssh_timeout(),
+            'connect_timeout': spec.timeout(),
             'ssh_args': spec.ssh_args(),
-            'ssh_debug_level': spec.mitogen_ssh_debug_level(),
+            'ssh_debug_level': spec.verbosity(),
             'remote_name': get_remote_name(spec),
             'keepalive_count': (
                 spec.mitogen_ssh_keepalive_count() or 10
@@ -157,6 +157,7 @@ def _connect_ssh(spec):
             ),
         }
     }
+
 
 def _connect_buildah(spec):
     """
@@ -168,10 +169,11 @@ def _connect_buildah(spec):
             'username': spec.remote_user(),
             'container': spec.remote_addr(),
             'python_path': spec.python_path(),
-            'connect_timeout': spec.ansible_ssh_timeout() or spec.timeout(),
+            'connect_timeout': spec.timeout(),
             'remote_name': get_remote_name(spec),
         }
     }
+
 
 def _connect_docker(spec):
     """
@@ -183,7 +185,7 @@ def _connect_docker(spec):
             'username': spec.remote_user(),
             'container': spec.remote_addr(),
             'python_path': spec.python_path(rediscover_python=True),
-            'connect_timeout': spec.ansible_ssh_timeout() or spec.timeout(),
+            'connect_timeout': spec.timeout(),
             'remote_name': get_remote_name(spec),
         }
     }
@@ -198,7 +200,7 @@ def _connect_kubectl(spec):
         'kwargs': {
             'pod': spec.remote_addr(),
             'python_path': spec.python_path(),
-            'connect_timeout': spec.ansible_ssh_timeout() or spec.timeout(),
+            'connect_timeout': spec.timeout(),
             'kubectl_path': spec.mitogen_kubectl_path(),
             'kubectl_args': spec.extra_args(),
             'remote_name': get_remote_name(spec),
@@ -216,7 +218,7 @@ def _connect_jail(spec):
             'username': spec.remote_user(),
             'container': spec.remote_addr(),
             'python_path': spec.python_path(),
-            'connect_timeout': spec.ansible_ssh_timeout() or spec.timeout(),
+            'connect_timeout': spec.timeout(),
             'remote_name': get_remote_name(spec),
         }
     }
@@ -232,7 +234,7 @@ def _connect_lxc(spec):
             'container': spec.remote_addr(),
             'python_path': spec.python_path(),
             'lxc_attach_path': spec.mitogen_lxc_attach_path(),
-            'connect_timeout': spec.ansible_ssh_timeout() or spec.timeout(),
+            'connect_timeout': spec.timeout(),
             'remote_name': get_remote_name(spec),
         }
     }
@@ -248,7 +250,7 @@ def _connect_lxd(spec):
             'container': spec.remote_addr(),
             'python_path': spec.python_path(),
             'lxc_path': spec.mitogen_lxc_path(),
-            'connect_timeout': spec.ansible_ssh_timeout() or spec.timeout(),
+            'connect_timeout': spec.timeout(),
             'remote_name': get_remote_name(spec),
         }
     }
@@ -271,10 +273,11 @@ def _connect_podman(spec):
             'username': spec.remote_user(),
             'container': spec.remote_addr(),
             'python_path': spec.python_path(rediscover_python=True),
-            'connect_timeout': spec.ansible_ssh_timeout() or spec.timeout(),
+            'connect_timeout': spec.timeout(),
             'remote_name': get_remote_name(spec),
         }
     }
+
 
 def _connect_setns(spec, kind=None):
     """
@@ -764,7 +767,7 @@ class Connection(ansible.plugins.connection.ConnectionBase):
                               C.BECOME_ALLOW_SAME_USER):
             stack += (CONNECTION_METHOD[spec.become_method()](spec),)
 
-        return stack
+        return ansible_mitogen.utils.unsafe.cast(stack)
 
     def _build_stack(self):
         """
@@ -797,7 +800,7 @@ class Connection(ansible.plugins.connection.ConnectionBase):
                 call_context=self.binding.get_service_context(),
                 service_name='ansible_mitogen.services.ContextService',
                 method_name='get',
-                stack=mitogen.utils.cast(list(stack)),
+                stack=ansible_mitogen.utils.unsafe.cast(list(stack)),
             )
         except mitogen.core.CallError:
             LOG.warning('Connection failed; stack configuration was:\n%s',
@@ -811,7 +814,7 @@ class Connection(ansible.plugins.connection.ConnectionBase):
 
         self.context = dct['context']
         self.chain = CallChain(self, self.context, pipelined=True)
-        if self._play_context.become:
+        if self.become:
             self.login_context = dct['via']
         else:
             self.login_context = self.context
@@ -848,7 +851,7 @@ class Connection(ansible.plugins.connection.ConnectionBase):
         inventory_name, stack = self._build_stack()
         worker_model = ansible_mitogen.process.get_worker_model()
         self.binding = worker_model.get_binding(
-            mitogen.utils.cast(inventory_name)
+            ansible_mitogen.utils.unsafe.cast(inventory_name)
         )
         self._connect_stack(stack)
 
@@ -887,6 +890,29 @@ class Connection(ansible.plugins.connection.ConnectionBase):
             self.binding.close()
             self.binding = None
 
+    def _mitogen_var_options(self, templar):
+        # Workaround for https://github.com/ansible/ansible/issues/84238
+        var_names = C.config.get_plugin_vars('connection', self._load_name)
+        variables = templar.available_variables
+        var_options = {
+            var_name: templar.template(variables[var_name])
+            for var_name in var_names
+            if var_name in variables
+        }
+
+        if self.allow_extras:
+            extras_var_prefix = 'ansible_%s_' % self.extras_prefix
+            var_options['_extras'] = {
+                var_name: templar.template(variables[var_name])
+                for var_name in variables
+                if var_name not in var_options
+                and var_name.startswith(extras_var_prefix)
+            }
+        else:
+            var_options['_extras'] = {}
+
+        return var_options
+
     reset_compat_msg = (
         'Mitogen only supports "reset_connection" on Ansible 2.5.6 or later'
     )
@@ -907,23 +933,44 @@ class Connection(ansible.plugins.connection.ConnectionBase):
                 self.reset_compat_msg
             )
 
-        # Strategy's _execute_meta doesn't have an action obj but we'll need one for
-        # running interpreter_discovery
-        # will create a new temporary action obj for this purpose
-        self._action = ansible_mitogen.mixins.ActionModuleMixin(
-            task=0,
-            connection=self,
-            play_context=self._play_context,
-            loader=0,
-            templar=0,
-            shared_loader_obj=0
-        )
+        # Handle templated connection variables during `meta: reset_connection`.
+        # Many bugs/implementation details of Mitogen & Ansible collide here.
+        # See #1079, #1096, #1132, ansible/ansible#84238, ...
+        try:
+            task, templar = self._play_context.vars.pop(
+                '_mitogen.smuggled.reset_connection',
+            )
+        except KeyError:
+            self._action_monkey_patched_by_mitogen = False
+        else:
+            # LOG.info('%r.reset(): remote_addr=%r', self, self._play_context.remote_addr)
+            # ansible.plugins.strategy.StrategyBase._execute_meta() doesn't
+            # have an action object, which we need for interpreter_discovery.
+            # Create a temporary action object for this purpose.
+            self._action = ansible_mitogen.mixins.ActionModuleMixin(
+                task=task,
+                connection=self,
+                play_context=self._play_context,
+                loader=templar._loader,
+                templar=templar,
+                shared_loader_obj=0,
+            )
+            self._action_monkey_patched_by_mitogen = True
+
+            # Workaround for https://github.com/ansible/ansible/issues/84238
+            self.set_options(
+                task_keys=task.dump_attrs(),
+                var_options=self._mitogen_var_options(templar),
+            )
+
+            del task
+            del templar
 
         # Clear out state in case we were ever connected.
         self.close()
 
         inventory_name, stack = self._build_stack()
-        if self._play_context.become:
+        if self.become:
             stack = stack[:-1]
 
         worker_model = ansible_mitogen.process.get_worker_model()
@@ -933,10 +980,15 @@ class Connection(ansible.plugins.connection.ConnectionBase):
                 call_context=binding.get_service_context(),
                 service_name='ansible_mitogen.services.ContextService',
                 method_name='reset',
-                stack=mitogen.utils.cast(list(stack)),
+                stack=ansible_mitogen.utils.unsafe.cast(list(stack)),
             )
         finally:
             binding.close()
+
+        # Cleanup any monkey patching we did for `meta: reset_connection`
+        if self._action_monkey_patched_by_mitogen:
+            del self._action
+        del self._action_monkey_patched_by_mitogen
 
     # Compatibility with Ansible 2.4 wait_for_connection plug-in.
     _reset = reset
@@ -1011,8 +1063,8 @@ class Connection(ansible.plugins.connection.ConnectionBase):
         emulate_tty = (not in_data and sudoable)
         rc, stdout, stderr = self.get_chain().call(
             ansible_mitogen.target.exec_command,
-            cmd=mitogen.utils.cast(cmd),
-            in_data=mitogen.utils.cast(in_data),
+            cmd=ansible_mitogen.utils.unsafe.cast(cmd),
+            in_data=ansible_mitogen.utils.unsafe.cast(in_data),
             chdir=mitogen_chdir or self.get_default_cwd(),
             emulate_tty=emulate_tty,
         )
@@ -1039,7 +1091,7 @@ class Connection(ansible.plugins.connection.ConnectionBase):
         ansible_mitogen.target.transfer_file(
             context=self.context,
             # in_path may be AnsibleUnicode
-            in_path=mitogen.utils.cast(in_path),
+            in_path=ansible_mitogen.utils.unsafe.cast(in_path),
             out_path=out_path
         )
 
@@ -1057,7 +1109,7 @@ class Connection(ansible.plugins.connection.ConnectionBase):
         """
         self.get_chain().call_no_reply(
             ansible_mitogen.target.write_path,
-            mitogen.utils.cast(out_path),
+            ansible_mitogen.utils.unsafe.cast(out_path),
             mitogen.core.Blob(data),
             mode=mode,
             utimes=utimes,
@@ -1119,7 +1171,7 @@ class Connection(ansible.plugins.connection.ConnectionBase):
             call_context=self.binding.get_service_context(),
             service_name='mitogen.service.FileService',
             method_name='register',
-            path=mitogen.utils.cast(in_path)
+            path=ansible_mitogen.utils.unsafe.cast(in_path)
         )
 
         # For now this must remain synchronous, as the action plug-in may have
@@ -1129,6 +1181,6 @@ class Connection(ansible.plugins.connection.ConnectionBase):
         self.get_chain().call(
             ansible_mitogen.target.transfer_file,
             context=self.binding.get_child_service_context(),
-            in_path=in_path,
-            out_path=out_path
+            in_path=ansible_mitogen.utils.unsafe.cast(in_path),
+            out_path=ansible_mitogen.utils.unsafe.cast(out_path)
         )

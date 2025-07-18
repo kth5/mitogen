@@ -15,14 +15,288 @@ Release Notes
     </style>
 
 To avail of fixes in an unreleased version, please download a ZIP file
-`directly from GitHub <https://github.com/dw/mitogen/>`_.
+`directly from GitHub <https://github.com/mitogen-hq/mitogen/>`_.
 
-v0.3.4.dev0
+
+In progress (unreleased)
+------------------------
+
+Ansible 12 has deprecated third-party strategy plugins. This is currently
+how Mitogen integrates with Ansible (e.g. `ANSIBLE_STRATEGY=mitogen_linear`).
+Running Ansible 12 + Mitogen will currently print a deprecation warning
+
+    [DEPRECATION WARNING]: Use of strategy plugins not included in
+    ansible.builtin are deprecated [...]. This feature will be removed from
+    ansible-core in a future release.
+
+Ansible + Mitogen will still work for now. Mitogen is considering alternatives
+to strategy plugins under :gh:issue:`1278`.
+
+* :gh:issue:`1303` CI: Switch to archived Debian 10 (buster) apt repository
+
+
+v0.3.25a3 (2025-07-02)
+----------------------
+
+* :gh:issue:`1285` CI: use `result_format = yaml` for Ansible test output,
+  instead of deprecated `stdout_callback = yaml`
+* :gh:issue:`1293` CI: Fix ``ansible_version`` comparisons when an Ansible
+  release candidate is under test
+* :gh:issue:`1275` CI: Test ``ansible_ssh_password`` behaviour without
+  ``sshpass`` installed
+* :gh:issue:`1282` :mod:`ansible_mitogen`: Support ``ANSIBLE_SSH_VERBOSITY``
+  with Ansible 12
+
+
+v0.3.25a2 (2025-06-21)
+----------------------
+
+* :gh:issue:`1274` :mod:`ansible_mitogen`: Replace use of `jsonify()`, which
+  is deprecated form Ansible 12 (ansible-core 2.19)
+
+
+v0.3.25a1 (2025-06-05)
+----------------------
+
+* :gh:issue:`1258` Initial Ansible 12 (ansible-core 2.19) support
+* :gh:issue:`1258` :mod:`ansible_mitogen`: Initial Ansible datatag support
+  (:gh:anspull:`84621`)
+* :gh:issue:`1258` :mod:`ansible_mitogen`: Ansible 12 (ansible-core 2.19) test
+  jobs
+
+
+v0.3.24 (2025-05-29)
+--------------------
+
+* :gh:issue:`1268` :mod:`mitogen` Only close stdin, stdout, and stderr file
+  descriptors (0, 1, and 2) if they were open at process startup.
+
+
+v0.3.23 (2025-04-28)
+--------------------
+
+* :gh:issue:`1121` :mod:`mitogen`: Log skipped :py:mod:`termios` attributes
+* :gh:issue:`1238` packaging: Avoid :py:mod:`ast`, requires Python = 2.6
+* :gh:issue:`1118` CI: Statically specify test usernames and group names
+* :gh:issue:`1118` CI: Don't copy SSH private key to temporary dir
+* :gh:issue:`1118` CI: Don't share temporary directory between test groupings
+* :gh:issue:`1256` CI: Upgrade Github jobs from Ubuntu 20.04 to 22.04 & 24.04
+* :gh:issue:`1263` packaging: Fix InvalidVersion in release versions
+
+
+v0.3.22 (2025-02-04)
+--------------------
+
+* :gh:issue:`1213` tests: Enable default Python warnings
+* :gh:issue:`1111` :mod:`mitogen`: Replace uses of deprecated
+  :py:func:`pkgutil.find_loader`
+* :gh:issue:`1213` :mod:`mitogen`: Fix unclosed file in first stage
+* :gh:issue:`1213` tests: Fix unclosed file in fd_check script
+* :gh:issue:`1213` :mod:`ansible_mitogen`: Don't redeclare Ansible interpreter
+  discovery attributes
+* :gh:issue:`1213` :mod:`ansible_mitogen`: Rename Mitogen interpreter discovery
+  attributes
+* :gh:issue:`1213` :mod:`ansible_mitogen`: Decouple possible_pythons order &
+  error handling
+* :gh:issue:`1213` :mod:`ansible_mitogen`: Return ``stderr_lines`` from
+  ``_low_level_execute_command()``
+* :gh:issue:`1227` tests: Name transport_config tests that use ``mitogen_via``
+* :gh:issue:`1143` :mod:`ansible_mitogen`: Fix dnf module include for dnf.cli
+* :gh:issue:`1234` :mod:`ansible_mitogen`: Fix :exc:`TypeError` in
+  :func:`ansible_mitogen.target.set_file_owner`
+
+
+v0.3.21 (2025-01-20)
+--------------------
+
+* :gh:issue:`1209` docs: Fix Netlify build of website
+* :gh:issue:`1216` :mod:`ansible_mitogen`: Add all ansible_freeipa modules to
+  the always-fork list.
+* :gh:issue:`766` :mod:`ansible_mitogen`: Fix ""could not recover task_vars"
+  and "get_with_context_result object has no attribute _create_control_path"
+  when using ``kubectl``, ``netconf``, or ``network_cli`` connection plugins.
+
+
+v0.3.20 (2025-01-07)
+--------------------
+
+* :gh:issue:`1079` :mod:`ansible_mitogen`: Fix :ans:mod:`wait_for_connection`
+  timeout with templated ``ansible_python_interpreter``
+* :gh:issue:`1079` :mod:`ansible_mitogen`: Fix templated python interpreter
+  with `meta: reset_connection`
+* :gh:issue:`1083` :mod:`ansible_mitogen`: Templated connection timeout
+  (e.g. ``ansible_timeout``).
+* :gh:issue:`740` :mod:`ansible_mitogen`: Respect ``interpreter_python``
+  in ``ansible.cfg`` and ``ANSIBLE_PYTHON_INTERPRETER`` environment variable.
+
+
+v0.3.19 (2024-12-02)
+--------------------
+
+* :gh:issue:`1129` :mod:`ansible_mitogen`: Ansible 11 support
+
+
+v0.3.18 (2024-11-07)
+--------------------
+
+* :gh:issue:`1083` :mod:`ansible_mitogen`: Templated become method
+  (e.g. ``ansible_become_method``).
+* :gh:issue:`1083` :mod:`ansible_mitogen`: Templated become flag
+  (e.g. ``ansible_become_method``, ``become`` keyword).
+
+
+v0.3.17 (2024-11-07)
+--------------------
+
+* :gh:issue:`1182` CI: Fix incorrect world readable/writable file permissions
+  on SSH key ``mitogen__has_sudo_pubkey.key`` during Ansible tests.
+* :gh:issue:`1083` :mod:`ansible_mitogen`: Templated SSH private key file
+  (e.g. ``ansible_private_key_file``).
+* :gh:issue:`1083` :mod:`ansible_mitogen`: Templated SSH host key checking
+  (e.g. ``ansible_host_key_checking``, ``ansible_ssh_host_key_checking``).
+* :gh:issue:`1083` :mod:`ansible_mitogen`: Templated host address
+  (e.g. ``ansible_host``, ``ansible_ssh_host``)
+* :gh:issue:`1184` Test templated SSH host key checking in task vars
+
+
+v0.3.16 (2024-11-05)
+--------------------
+
+* :gh:issue:`1083` :mod:`ansible_mitogen`: Templated become executable
+  (e.g. ``become_exe``).
+* :gh:issue:`1083` :mod:`ansible_mitogen`: Templated become executable
+  arguments (e.g. ``become_flags``).
+* :gh:issue:`1083` :mod:`ansible_mitogen`: Templated ssh executable
+  (``ansible_ssh_executable``).
+* :gh:issue:`1083` :mod:`ansible_mitogen`: Fixed templated connection options
+  during a ``meta: reset_connection`` task.
+* :gh:issue:`1129` CI: Migrated macOS 12 runners to macOS 13, due to EOL.
+
+
+v0.3.15 (2024-10-28)
+--------------------
+
+* :gh:issue:`905` :mod:`ansible_mitogen`: Support templated SSH command
+  arguments (e.g. ``ansible_ssh_args``, ``ansible_ssh_extra_args``).
+* :gh:issue:`692` tests: Fix and re-enable several sudo tests
+* :gh:issue:`1083` :mod:`ansible_mitogen`: Support templated become password
+  (e.g. ``ansible_become_pass``, ``ansible_sudo_pass``)
+
+
+v0.3.14 (2024-10-16)
+--------------------
+
+* :gh:issue:`1159` CI: Reduce number of Jobs by parameterizing Mitogen Docker
+  SSH tests
+* :gh:issue:`1083` :mod:`ansible_mitogen`: Support templated become username.
+
+
+v0.3.13 (2024-10-09)
+--------------------
+
+* :gh:issue:`1138` CI: Complete migration from Azure DevOps Pipelines to
+  GitHub Actions
+* :gh:issue:`1116` :mod:`ansible_mitogen`: Support for templated variable
+  `ansible_ssh_user`.
+* :gh:issue:`978` :mod:`ansible_mitogen`: Support templated Ansible SSH port.
+* :gh:issue:`1073` Python 3.13 support
+
+
+v0.3.12 (2024-10-07)
+--------------------
+
+* :gh:issue:`1106` :mod:`ansible_mitogen`: Support for `ansible_ssh_password`
+  connection variable, and templated SSH connection password.
+* :gh:issue:`1136` tests: Improve Ansible fail_msg formatting.
+* :gh:issue:`1137` tests: Ignore inventory files of inactive tests & benchmarks
+* :gh:issue:`1138` CI: Add re-actors/alls-green GitHub Actions job to simplify
+  branch protections configuration.
+
+
+v0.3.11 (2024-09-30)
+--------------------
+
+* :gh:issue:`1127` :mod:`mitogen`: Consolidate mitogen backward compatibility
+  fallbacks and polyfills into :mod:`mitogen.core`
+* :gh:issue:`1127` :mod:`ansible_mitogen`: Remove backward compatibility
+  fallbacks for Python 2.4 & 2.5.
+* :gh:issue:`1127` :mod:`ansible_mitogen`: Remove fallback imports for Ansible
+  releases before 2.10
+* :gh:issue:`1127` :mod:`ansible_mitogen`: Consolidate Python 2 & 3
+  compatibility
+* :gh:issue:`1128` CI: Start migration from Azure DevOps to GitHub Actions
+
+
+v0.3.10 (2024-09-20)
+--------------------
+
+* :gh:issue:`950` Fix Solaris/Illumos/SmartOS compatibility with become
+* :gh:issue:`1087` Fix :exc:`mitogen.core.StreamError` when Ansible template
+  module is called with a ``dest:`` filename that has an extension
+* :gh:issue:`1110` Fix :exc:`mitogen.core.StreamError` when Ansible copy
+  module is called with a file larger than 124 kibibytes
+  (:data:`ansible_mitogen.connection.Connection.SMALL_FILE_LIMIT`)
+* :gh:issue:`905` Initial support for templated ``ansible_ssh_args``,
+  ``ansible_ssh_common_args``, and ``ansible_ssh_extra_args`` variables.
+  NB: play or task scoped variables will probably still fail.
+* :gh:issue:`694` CI: Fixed a race condition and some resource leaks causing
+  some of intermittent failures when running the test suite.
+
+
+v0.3.9 (2024-08-13)
+-------------------
+
+* :gh:issue:`1097` Respect `ansible_facts.discovered_interpreter_python` when
+  executing non new-style modules (e.g. JSONARGS style, WANT_JSON style).
+* :gh:issue:`1074` Support Ansible 10 (ansible-core 2.17)
+
+
+v0.3.8 (2024-07-30)
+-------------------
+
+* :gh:issue:`952` Fix Ansible `--ask-become-pass`, add test coverage
+* :gh:issue:`957` Fix Ansible exception when executing against 10s of hosts
+  "ValueError: filedescriptor out of range in select()"
+* :gh:issue:`1066` Support Ansible `ansible_host_key_checking` & `ansible_ssh_host_key_checking`
+* :gh:issue:`1090` CI: Migrate macOS integration tests to macOS 12, drop Python 2.7 jobs
+
+
+v0.3.7 (2024-04-08)
+-------------------
+
+* :gh:issue:`1021` Support for Ansible 8 (ansible-core 2.15)
+* tests: Replace uses of ``include:`` & ``import:``, unsupported in Ansible 9
+* :gh:issue:`1053` Support for Ansible 9 (ansible-core 2.16)
+
+
+v0.3.6 (2024-04-04)
+-------------------
+
+* :gh:issue:`974` Support Ansible 7
+* :gh:issue:`1046` Raise :py:exc:`TypeError` in :func:`<mitogen.util.cast()>`
+  when casting a string subtype to `bytes()` or `str()` fails. This is
+  potentially an API breaking change. Failures previously passed silently.
+* :gh:issue:`1046` Add :func:`<ansible_mitogen.util.cast()>`, to cast
+  :class:`ansible.utils.unsafe_proxy.AnsibleUnsafe` objects in Ansible 7+.
+
+
+v0.3.5 (2024-03-17)
+-------------------
+
+* :gh:issue:`987` Support Python 3.11
+* :gh:issue:`885` Fix :py:exc:`PermissionError` in :py:mod:`importlib` when
+  becoming an unprivileged user with Python 3.x
+* :gh:issue:`1033` Support `PEP 451 <https://peps.python.org/pep-0451/>`_,
+  required by Python 3.12
+* :gh:issue:`1033` Support Python 3.12
+
+
+v0.3.4 (2023-07-02)
 -------------------
 
 * :gh:issue:`929` Support Ansible 6 and ansible-core 2.13
 * :gh:issue:`832` Fix runtime error when using the ansible.builtin.dnf module multiple times
-* :gh:issue:`925` :class:`ansible_mitogen.connection.Connection` no longer tries to close the 
+* :gh:issue:`925` :class:`ansible_mitogen.connection.Connection` no longer tries to close the
   connection on destruction. This is expected to reduce cases of `mitogen.core.Error: An attempt
   was made to enqueue a message with a Broker that has already exitted`. However it may result in
   resource leaks.
@@ -65,7 +339,7 @@ v0.3.0 (2021-11-24)
 -------------------
 
 This release separates itself from the v0.2.X releases. Ansible's API changed too much to support backwards compatibility so from now on, v0.2.X releases will be for Ansible < 2.10 and v0.3.X will be for Ansible 2.10+.
-`See here for details <https://github.com/dw/mitogen/pull/715#issuecomment-750697248>`_.
+`See here for details <https://github.com/mitogen-hq/mitogen/pull/715#issuecomment-750697248>`_.
 
 * :gh:issue:`827` NewStylePlanner: detect `ansible_collections` imports
 * :gh:issue:`770` better check for supported Ansible version
@@ -86,7 +360,7 @@ v0.2.10 (2021-11-24)
 * :gh:issue:`756` ssh connections with `check_host_keys='accept'` would
   timeout, when using recent OpenSSH client versions.
 * :gh:issue:`758` fix initilialisation of callback plugins in test suite, to address a `KeyError` in
-  :method:`ansible.plugins.callback.CallbackBase.v2_runner_on_start`
+  :py:meth:`ansible.plugins.callback.CallbackBase.v2_runner_on_start`
 * :gh:issue:`775` Test with Python 3.9
 * :gh:issue:`775` Add msvcrt to the default module deny list
 
@@ -172,7 +446,7 @@ Mitogen for Ansible
   :linux:man7:`unix` sockets across privilege domains.
 
 * :gh:issue:`467`: an incompatibility running Mitogen under `Molecule
-  <https://molecule.readthedocs.io/en/stable/>`_ was resolved.
+  <https://ansible.readthedocs.io/projects/molecule/>`_ was resolved.
 
 * :gh:issue:`547`, :gh:issue:`598`: fix a deadlock during initialization of
   connections, ``async`` tasks, tasks using custom :mod:`module_utils`,
@@ -1224,9 +1498,8 @@ Core Library
   parameter may specify an argument vector prefix rather than a string program
   path.
 
-* :gh:issue:`300`: the broker could crash on
-  OS X during shutdown due to scheduled `kqueue
-  <https://www.freebsd.org/cgi/man.cgi?query=kqueue>`_ filter changes for
+* :gh:issue:`300`: the broker could crash on OS X during shutdown due to
+  scheduled :freebsd:man2:`kqueue` filter changes for
   descriptors that were closed before the IO loop resumes. As a temporary
   workaround, kqueue's bulk change feature is not used.
 

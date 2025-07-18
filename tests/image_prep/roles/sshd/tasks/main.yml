@@ -1,0 +1,20 @@
+- name: Create login banner
+  copy:
+    src: banner.txt
+    dest: /etc/ssh/banner.txt
+    mode: u=rw,go=r
+
+- name: Configure sshd_config
+  lineinfile:
+    path: "{{ sshd_config_file }}"
+    line: "{{ item.line }}"
+    regexp: "{{ item.regexp }}"
+  with_items:
+    - line:     Banner /etc/ssh/banner.txt
+      regexp:   '^#? *Banner.*'
+    - line:     MaxAuthTries {{ sshd_config__max_auth_tries }}
+      regexp:   '^#? *MaxAuthTries.*'
+    - line:     PermitRootLogin yes
+      regexp:   '.*PermitRootLogin.*'
+  notify:
+    - Restart sshd  # Handler in platform specific role

@@ -62,25 +62,21 @@ from __future__ import unicode_literals
 __metaclass__ = type
 
 import abc
+import logging
 import os
+
 import ansible.utils.shlex
 import ansible.constants as C
+import ansible.executor.interpreter_discovery
+import ansible.utils.unsafe_proxy
 
 from ansible.module_utils.six import with_metaclass
+from ansible.module_utils.parsing.convert_bool import boolean
 
-# this was added in Ansible >= 2.8.0; fallback to the default interpreter if necessary
-try:
-    from ansible.executor.interpreter_discovery import discover_interpreter
-except ImportError:
-    discover_interpreter = lambda action,interpreter_name,discovery_mode,task_vars: '/usr/bin/python'
-
-try:
-    from ansible.utils.unsafe_proxy import AnsibleUnsafeText
-except ImportError:
-    from ansible.vars.unsafe_proxy import AnsibleUnsafeText
-
-import ansible_mitogen.loaders
 import mitogen.core
+
+
+LOG = logging.getLogger(__name__)
 
 
 def run_interpreter_discovery_if_necessary(s, task_vars, action, rediscover_python):
@@ -91,9 +87,9 @@ def run_interpreter_discovery_if_necessary(s, task_vars, action, rediscover_pyth
     it could be different than what's ran on the host
     """
     # keep trying different interpreters until we don't error
-    if action._finding_python_interpreter:
-        return action._possible_python_interpreter
-    
+    if action._mitogen_discovering_interpreter:
+        return action._mitogen_interpreter_candidate
+
     if s in ['auto', 'auto_legacy', 'auto_silent', 'auto_legacy_silent']:
         # python is the only supported interpreter_name as of Ansible 2.8.8
         interpreter_name = 'python'
@@ -109,21 +105,22 @@ def run_interpreter_discovery_if_necessary(s, task_vars, action, rediscover_pyth
             # if we're rediscovering python then chances are we're running something like a docker connection
             # this will handle scenarios like running a playbook that does stuff + then dynamically creates a docker container,
             # then runs the rest of the playbook inside that container, and then rerunning the playbook again
-            action._rediscovered_python = True
+            action._mitogen_rediscovered_interpreter = True
 
             # blow away the discovered_interpreter_config cache and rediscover
             del task_vars['ansible_facts'][discovered_interpreter_config]
 
         if discovered_interpreter_config not in task_vars['ansible_facts']:
-            action._finding_python_interpreter = True
+            action._mitogen_discovering_interpreter = True
             # fake pipelining so discover_interpreter can be happy
             action._connection.has_pipelining = True
-            s = AnsibleUnsafeText(discover_interpreter(
+            s = ansible.executor.interpreter_discovery.discover_interpreter(
                 action=action,
                 interpreter_name=interpreter_name,
                 discovery_mode=s,
-                task_vars=task_vars))
-
+                task_vars=task_vars,
+            )
+            s = ansible.utils.unsafe_proxy.AnsibleUnsafeText(s)
             # cache discovered interpreter
             task_vars['ansible_facts'][discovered_interpreter_config] = s
             action._connection.has_pipelining = False
@@ -134,14 +131,14 @@ def run_interpreter_discovery_if_necessary(s, task_vars, action, rediscover_pyth
         action._discovered_interpreter_key = discovered_interpreter_config
         action._discovered_interpreter = s
 
-    action._finding_python_interpreter = False
+    action._mitogen_discovering_interpreter = False
     return s
 
 
 def parse_python_path(s, task_vars, action, rediscover_python):
     """
     Given the string set for ansible_python_interpeter, parse it using shell
-    syntax and return an appropriate argument vector. If the value detected is 
+    syntax and return an appropriate argument vector. If the value detected is
     one of interpreter discovery then run that first. Caches python interpreter
     discovery value in `facts_from_task_vars` like how Ansible handles this.
     """
@@ -220,6 +217,12 @@ class Spec(with_metaclass(abc.ABCMeta, object)):
         """
 
     @abc.abstractmethod
+    def become_flags(self):
+        """
+        The command line arguments passed to the become executable.
+        """
+
+    @abc.abstractmethod
     def become_method(self):
         """
         The name of the Ansible become method to use.
@@ -247,6 +250,12 @@ class Spec(with_metaclass(abc.ABCMeta, object)):
     def python_path(self):
         """
         Path to the Python interpreter on the target machine.
+        """
+
+    @abc.abstractmethod
+    def host_key_checking(self):
+        """
+        Whether or not to check the keys of the target machine
         """
 
     @abc.abstractmethod
@@ -290,10 +299,9 @@ class Spec(with_metaclass(abc.ABCMeta, object)):
     @abc.abstractmethod
     def sudo_args(self):
         """
-        The list of additional arguments that should be included in a become
+        The list of additional arguments that should be included in a sudo
         invocation.
         """
-        # TODO: split out into sudo_args/become_args.
 
     @abc.abstractmethod
     def mitogen_via(self):
@@ -401,6 +409,12 @@ class Spec(with_metaclass(abc.ABCMeta, object)):
         Value of "ansible_doas_exe" variable.
         """
 
+    @abc.abstractmethod
+    def verbosity(self):
+        """
+        How verbose to make logging or diagnostics output.
+        """
+
 
 class PlayContextSpec(Spec):
     """
@@ -417,6 +431,43 @@ class PlayContextSpec(Spec):
         # used to run interpreter discovery
         self._action = connection._action
 
+    def _become_option(self, name):
+        plugin = self._connection.become
+        try:
+            return plugin.get_option(name, self._task_vars, self._play_context)
+        except AttributeError:
+            # A few ansible_mitogen connection plugins look more like become
+            # plugins. They don't quite fit Ansible's plugin.get_option() API.
+            # https://github.com/mitogen-hq/mitogen/issues/1173
+            fallback_plugins = {'mitogen_doas', 'mitogen_sudo', 'mitogen_su'}
+            if self._connection.transport not in fallback_plugins:
+                raise
+
+            fallback_options = {
+                'become_exe',
+                'become_flags',
+            }
+            if name not in fallback_options:
+                raise
+
+            LOG.info(
+                'Used fallback=PlayContext.%s for plugin=%r, option=%r',
+                name, self._connection, name,
+            )
+            return getattr(self._play_context, name)
+
+    def _connection_option(self, name, fallback_attr=None):
+        try:
+            return self._connection.get_option(name, hostvars=self._task_vars)
+        except KeyError:
+            if fallback_attr is None:
+                fallback_attr = name
+            LOG.info(
+                'Used fallback=PlayContext.%s for plugin=%r, option=%r',
+                fallback_attr, self._connection, name,
+            )
+            return getattr(self._play_context, fallback_attr)
+
     def transport(self):
         return self._transport
 
@@ -424,95 +475,86 @@ class PlayContextSpec(Spec):
         return self._inventory_name
 
     def remote_addr(self):
-        return self._play_context.remote_addr
+        return self._connection_option('host', fallback_attr='remote_addr')
 
     def remote_user(self):
-        return self._play_context.remote_user
+        return self._connection_option('remote_user')
 
     def become(self):
-        return self._play_context.become
+        return self._connection.become
+
+    def become_flags(self):
+        return self._become_option('become_flags')
 
     def become_method(self):
-        return self._play_context.become_method
+        return self._connection.become.name
 
     def become_user(self):
-        return self._play_context.become_user
+        return self._become_option('become_user')
 
     def become_pass(self):
-        become_method = self.become_method()
-        become_plugin = ansible_mitogen.loaders.become_loader.get(become_method)
-        become_pass = become_plugin.get_option('become_pass', hostvars=self._task_vars)
-        return optional_secret(become_pass)
+        return optional_secret(self._become_option('become_pass'))
 
     def password(self):
-        return optional_secret(self._play_context.password)
+        return optional_secret(self._connection_option('password'))
 
     def port(self):
-        return self._play_context.port
+        return self._connection_option('port')
 
     def python_path(self, rediscover_python=False):
-        s = self._connection.get_task_var('ansible_python_interpreter')
-        # #511, #536: executor/module_common.py::_get_shebang() hard-wires
-        # "/usr/bin/python" as the default interpreter path if no other
-        # interpreter is specified.
+        # See also
+        #   - ansible_mitogen.connecton.Connection.get_task_var()
+        try:
+            delegated_vars = self._task_vars['ansible_delegated_vars']
+            variables = delegated_vars[self._connection.delegate_to_hostname]
+        except KeyError:
+            variables = self._task_vars
+
+        interpreter_python = C.config.get_config_value(
+            'INTERPRETER_PYTHON', variables=variables,
+        )
+
+        if '{{' in interpreter_python or '{%' in interpreter_python:
+            templar = self._connection.templar
+            interpreter_python = templar.template(interpreter_python)
+
         return parse_python_path(
-            s,
+            interpreter_python,
             task_vars=self._task_vars,
             action=self._action,
             rediscover_python=rediscover_python)
 
+    def host_key_checking(self):
+        return self._connection_option('host_key_checking')
+
     def private_key_file(self):
-        return self._play_context.private_key_file
+        return self._connection_option('private_key_file')
 
     def ssh_executable(self):
-        return C.config.get_config_value("ssh_executable", plugin_type="connection", plugin_name="ssh", variables=self._task_vars.get("vars", {}))
+        return self._connection_option('ssh_executable')
 
     def timeout(self):
-        return self._play_context.timeout
+        return self._connection_option('timeout')
 
     def ansible_ssh_timeout(self):
-        return (
-            self._connection.get_task_var('ansible_timeout') or
-            self._connection.get_task_var('ansible_ssh_timeout') or
-            self.timeout()
-        )
+        return self.timeout()
 
     def ssh_args(self):
         return [
             mitogen.core.to_text(term)
             for s in (
-                C.config.get_config_value("ssh_args", plugin_type="connection", plugin_name="ssh", variables=self._task_vars.get("vars", {})),
-                C.config.get_config_value("ssh_common_args", plugin_type="connection", plugin_name="ssh", variables=self._task_vars.get("vars", {})),
-                C.config.get_config_value("ssh_extra_args", plugin_type="connection", plugin_name="ssh", variables=self._task_vars.get("vars", {}))
+                self._connection_option('ssh_args'),
+                self._connection_option('ssh_common_args'),
+                self._connection_option('ssh_extra_args'),
             )
             for term in ansible.utils.shlex.shlex_split(s or '')
         ]
 
     def become_exe(self):
-        # In Ansible 2.8, PlayContext.become_exe always has a default value due
-        # to the new options mechanism. Previously it was only set if a value
-        # ("somewhere") had been specified for the task.
-        # For consistency in the tests, here we make older Ansibles behave like
-        # newer Ansibles.
-        exe = self._play_context.become_exe
-        if exe is None and self._play_context.become_method == 'sudo':
-            exe = 'sudo'
-        return exe
+        return self._become_option('become_exe')
 
     def sudo_args(self):
-        return [
-            mitogen.core.to_text(term)
-            for term in ansible.utils.shlex.shlex_split(
-                first_true((
-                    self._play_context.become_flags,
-                    # Ansible <=2.7.
-                    getattr(self._play_context, 'sudo_flags', ''),
-                    # Ansible <=2.3.
-                    getattr(C, 'DEFAULT_BECOME_FLAGS', ''),
-                    getattr(C, 'DEFAULT_SUDO_FLAGS', '')
-                ), default='')
-            )
-        ]
+        return ansible.utils.shlex.shlex_split(self.become_flags() or '')
 
     def mitogen_via(self):
         return self._connection.get_task_var('mitogen_via')
@@ -567,6 +609,17 @@ class PlayContextSpec(Spec):
             self._connection.get_task_var('ansible_doas_exe') or
             os.environ.get('ANSIBLE_DOAS_EXE')
         )
+
+    def verbosity(self):
+        try:
+            verbosity = self._connection.get_option('verbosity', hostvars=self._task_vars)
+        except KeyError:
+            verbosity = self.mitogen_ssh_debug_level()
+
+        if verbosity:
+            return int(verbosity)
+
+        return 0
 
 
 class MitogenViaSpec(Spec):
@@ -647,6 +700,9 @@ class MitogenViaSpec(Spec):
     def become(self):
         return bool(self._become_user)
 
+    def become_flags(self):
+        return self._host_vars.get('ansible_become_flags')
+
     def become_method(self):
         return (
             self._become_method or
@@ -665,6 +721,7 @@ class MitogenViaSpec(Spec):
 
     def password(self):
         return optional_secret(
+            self._host_vars.get('ansible_ssh_password') or
             self._host_vars.get('ansible_ssh_pass') or
             self._host_vars.get('ansible_password')
         )
@@ -686,6 +743,14 @@ class MitogenViaSpec(Spec):
             task_vars=self._task_vars,
             action=self._action,
             rediscover_python=rediscover_python)
+
+    def host_key_checking(self):
+        def candidates():
+            yield self._host_vars.get('ansible_ssh_host_key_checking')
+            yield self._host_vars.get('ansible_host_key_checking')
+            yield C.HOST_KEY_CHECKING
+        val = next((v for v in candidates() if v is not None), True)
+        return boolean(val)
 
     def private_key_file(self):
         # TODO: must come from PlayContext too.
@@ -710,12 +775,13 @@ class MitogenViaSpec(Spec):
         )
 
     def ssh_args(self):
+        local_vars = self._task_vars.get("hostvars", {}).get(self._inventory_name, {})
         return [
             mitogen.core.to_text(term)
             for s in (
-                C.config.get_config_value("ssh_args", plugin_type="connection", plugin_name="ssh", variables=self._task_vars.get("vars", {})),
-                C.config.get_config_value("ssh_common_args", plugin_type="connection", plugin_name="ssh", variables=self._task_vars.get("vars", {})),
-                C.config.get_config_value("ssh_extra_args", plugin_type="connection", plugin_name="ssh", variables=self._task_vars.get("vars", {}))
+                C.config.get_config_value("ssh_args", plugin_type="connection", plugin_name="ssh", variables=local_vars),
+                C.config.get_config_value("ssh_common_args", plugin_type="connection", plugin_name="ssh", variables=local_vars),
+                C.config.get_config_value("ssh_extra_args", plugin_type="connection", plugin_name="ssh", variables=local_vars)
             )
             for term in ansible.utils.shlex.shlex_split(s)
             if s
@@ -732,7 +798,7 @@ class MitogenViaSpec(Spec):
             mitogen.core.to_text(term)
             for s in (
                 self._host_vars.get('ansible_sudo_flags') or '',
-                self._host_vars.get('ansible_become_flags') or '',
+                self.become_flags() or '',
             )
             for term in ansible.utils.shlex.shlex_split(s)
         ]
@@ -790,3 +856,13 @@ class MitogenViaSpec(Spec):
             self._host_vars.get('ansible_doas_exe') or
             os.environ.get('ANSIBLE_DOAS_EXE')
         )
+
+    def verbosity(self):
+        verbosity = self._host_vars.get('ansible_ssh_verbosity')
+        if verbosity is None:
+            verbosity = self.mitogen_ssh_debug_level()
+
+        if verbosity:
+            return int(verbosity)
+
+        return 0

@@ -12,7 +12,9 @@
         https_proxy: "{{ lookup('env', 'https_proxy')|default('') }}"
         no_proxy: "{{ lookup('env', 'no_proxy')|default('') }}"
         PATH: "{{ lookup('env', 'PATH') }}"
-      shell: virtualenv /tmp/issue_152_virtualenv
+      command:
+        cmd: virtualenv -p "{{ ansible_facts.python.executable }}" /tmp/issue_152_virtualenv
+        creates: /tmp/issue_152_virtualenv
       when:
         - lout.python.version.full is version('2.7', '>=', strict=True)
 
@@ -23,10 +25,18 @@
       when:
         - lout.python.version.full is version('2.7', '>=', strict=True)
 
-    - assert:
+    - name: Check virtualenv was used
+      # On macOS runners a symlink /tmp -> /private/tmp has been seen
+      vars:
+        requested_executable: /tmp/issue_152_virtualenv/bin/python
+        expected_executables:
+          - "{{ requested_executable }}"
+          - "{{ requested_executable.replace('/tmp', out.fs['/tmp'].resolved) }}"
+      assert:
         that:
-          - out.sys_executable == "/tmp/issue_152_virtualenv/bin/python"
-        fail_msg: out={{out}}
+          - out.sys_executable in expected_executables
+        fail_msg: |
+          out={{ out }}
       when:
         - lout.python.version.full is version('2.7', '>=', strict=True)
 

@@ -6,16 +6,19 @@
 - name: integration/transport_config/transport.yml
   hosts: tc-transport-unset
   tasks:
-  - include: ../_mitogen_only.yml
+  - include_tasks: ../_mitogen_only.yml
   - {mitogen_get_stack: {}, register: out}
   - assert_equal:
       left: out.result[0].method
       right: "ssh"
+  tags:
+    - mitogen_only
 
-- hosts: tc-transport-local
+- name: tc-transport-local via tc-transport-unset
+  hosts: tc-transport-local
   vars: {mitogen_via: tc-transport-unset}
   tasks:
-  - include: ../_mitogen_only.yml
+  - include_tasks: ../_mitogen_only.yml
   - {mitogen_get_stack: {}, register: out}
   - assert_equal:
       left: out.result[0].method
@@ -23,22 +26,27 @@
   - assert_equal:
       left: out.result[1].method
       right: "local"
+  tags:
+    - mitogen_only
 
 
 # ansible_connection=local
 
 - hosts: tc-transport-local
   tasks:
-  - include: ../_mitogen_only.yml
+  - include_tasks: ../_mitogen_only.yml
   - {mitogen_get_stack: {}, register: out}
   - assert_equal:
       left: out.result[0].method
       right: "local"
+  tags:
+    - mitogen_only
 
-- hosts: tc-transport-unset
+- name: tc-transport-unset via tc-transport-local
+  hosts: tc-transport-unset
   vars: {mitogen_via: tc-transport-local}
   tasks:
-  - include: ../_mitogen_only.yml
+  - include_tasks: ../_mitogen_only.yml
   - {mitogen_get_stack: {}, register: out}
   - assert_equal:
       left: out.result[0].method
@@ -46,3 +54,5 @@
   - assert_equal:
       left: out.result[1].method
       right: "ssh"
+  tags:
+    - mitogen_only

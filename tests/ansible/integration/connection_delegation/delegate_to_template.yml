@@ -11,16 +11,15 @@
 - name: integration/connection_delegation/delegate_to_template.yml
   vars:
     physical_host: "cd-normal-alias"
-    physical_hosts: ["cd-normal-alias", "cd-normal-normal"]
   hosts: test-targets
   gather_facts: no
   tasks:
-    - meta: end_play
-      when: not is_mitogen
+    - include_tasks: ../_mitogen_only.yml
+    - include_tasks: ../_expected_ssh_port.yml
 
     - meta: end_play
       when:
-        - ansible_version.full is version('2.4', '<', strict=True)
+        - ansible_version_major_minor is version('2.4', '<', strict=True)
 
     - mitogen_get_stack:
       delegate_to: "{{ physical_host }}"
@@ -41,19 +40,17 @@
               'keepalive_count': 10,
               'password': null,
               'port': null,
-              'python_path': ["/usr/bin/python"],
+              'python_path': ['python3000'],
               'remote_name': null,
               'ssh_args': [
-                '-o',
-                'UserKnownHostsFile=/dev/null',
-                '-o',
-                'ForwardAgent=yes',
-                '-o',
-                'ControlMaster=auto',
-                '-o',
-                'ControlPersist=60s',
+                -o, ControlMaster=auto,
+                -o, ControlPersist=60s,
+                -o, ForwardAgent=yes,
+                -o, HostKeyAlgorithms=+ssh-rsa,
+                -o, PubkeyAcceptedKeyTypes=+ssh-rsa,
+                -o, UserKnownHostsFile=/dev/null,
               ],
-              'ssh_debug_level': null,
+              'ssh_debug_level': 0,
               'ssh_path': 'ssh',
               'username': 'alias-user',
             },
@@ -70,20 +67,18 @@
               'keepalive_interval': 30,
               'keepalive_count': 10,
               'password': null,
-              'port': null,
-              'python_path': ["/usr/bin/python"],
+              'port': '{{ expected_ssh_port }}',
+              'python_path': ['python3000'],
               'remote_name': null,
               'ssh_args': [
-                '-o',
-                'UserKnownHostsFile=/dev/null',
-                '-o',
-                'ForwardAgent=yes',
-                '-o',
-                'ControlMaster=auto',
-                '-o',
-                'ControlPersist=60s',
+                -o, ControlMaster=auto,
+                -o, ControlPersist=60s,
+                -o, ForwardAgent=yes,
+                -o, HostKeyAlgorithms=+ssh-rsa,
+                -o, PubkeyAcceptedKeyTypes=+ssh-rsa,
+                -o, UserKnownHostsFile=/dev/null,
               ],
-              'ssh_debug_level': null,
+              'ssh_debug_level': 0,
               'ssh_path': 'ssh',
               'username': 'ansible-cfg-remote-user',
             },
@@ -92,3 +87,4 @@
         ]
   tags:
     - delegate_to_template
+    - mitogen_only
