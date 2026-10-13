@@ -44,7 +44,6 @@ import ctypes
 import json
 import logging
 import os
-import re
 import shlex
 import shutil
 import sys
@@ -52,25 +51,36 @@ import tempfile
 import traceback
 import types
 
-from ansible.module_utils.six.moves import shlex_quote
+if sys.version_info >= (3, 4):
+    import importlib.machinery
+else:
+    import imp
+
+import ansible.module_utils.common.warnings
 
 import mitogen.core
+import mitogen.parent
 import ansible_mitogen.target  # TODO: circular import
 from mitogen.core import to_text
 
-try:
-    # Python >= 3.4, PEP 451 ModuleSpec API
-    import importlib.machinery
-    import importlib.util
-except ImportError:
-    # Python < 3.4, PEP 302 Import Hooks
-    import imp
+from ansible_mitogen.compat.six import shlex_quote
 
 try:
     # Cannot use cStringIO as it does not support Unicode.
     from StringIO import StringIO
 except ImportError:
     from io import StringIO
+
+# Ansible >= 2.7 ansible.module_utils.basic uses `import __main__` (PR #41749).
+# Under vanilla Ansible it is benign:
+#  - controller: __main__ is a CLI module (e.g. ansible.cli.playbook)
+#  - target: __main__ is the executing Ansible module (e.g. command, dnf)
+# Mitogen + Ansible refuses `import __main__` by mitogen.core.Importer policy.
+# So inject a (temporary) placeholder.
+if '__main__' not in sys.modules:
+    sys.modules['__main__'] = types.ModuleType(
+        'ansible_mitogen.injected.i_cant_believe_its_not__main__',
+    )
 
 # Prevent accidental import of an Ansible module from hanging on stdin read.
 # FIXME Should probably be b'{}' or None. Ansible 2.19 has bytes | None = None.
@@ -99,7 +109,7 @@ def shlex_split_b(s):
     bytes.
     """
     assert isinstance(s, mitogen.core.BytesType)
-    if mitogen.core.PY3:
+    if sys.version_info >= (3, 0):
         return [
             t.encode('latin1')
             for t in shlex.split(s.decode('latin1'), comments=True)
@@ -908,6 +918,17 @@ class NewStyleRunner(ScriptRunner):
 
                 raise
 
+    def _setup_module_utils_globals(self):
+        "Remove lingering global state from previous task."
+        _global_warnings = ansible.module_utils.common.warnings._global_warnings
+        _global_deprecations = ansible.module_utils.common.warnings._global_deprecations
+        if isinstance(_global_warnings, list):
+            del _global_warnings[:]
+            del _global_deprecations[:]
+        else:
+            _global_warnings.clear()
+            _global_deprecations.clear()
+
     def _setup_excepthook(self):
         """
         Starting with Ansible 2.6, some modules (file.py) install a
@@ -930,6 +951,7 @@ class NewStyleRunner(ScriptRunner):
             module_utils=self.module_map['custom'],
         )
         self._setup_imports()
+        self._setup_module_utils_globals()
         self._setup_excepthook()
         self.atexit_wrapper = AtExitWrapper()
         if libc__res_init:
@@ -955,19 +977,12 @@ class NewStyleRunner(ScriptRunner):
     def _setup_args(self):
         pass
 
-    # issue #555: in old times it was considered good form to reload sys and
-    # change the default encoding. This hack was removed from Ansible long ago,
-    # but not before permeating into many third party modules.
-    PREHISTORIC_HACK_RE = re.compile(
-        br'reload\s*\(\s*sys\s*\)\s*sys\s*\.\s*setdefaultencoding\([^)]+\)',
-    )
-
     def _setup_program(self):
         source = ansible_mitogen.target.get_small_file(
             context=self.service_context,
             path=self.path,
         )
-        self.source = self.PREHISTORIC_HACK_RE.sub(b'', source)
+        self.source = source
 
     def _get_code(self):
         try:
@@ -981,11 +996,6 @@ class NewStyleRunner(ScriptRunner):
                 0,                      # flags
                 True,                   # dont_inherit
             ))
-
-    if mitogen.core.PY3:
-        main_module_name = '__main__'
-    else:
-        main_module_name = b'__main__'
 
     def _handle_magic_exception(self, mod, exc):
         """
@@ -1003,7 +1013,7 @@ class NewStyleRunner(ScriptRunner):
 
     def _run_code(self, code, mod):
         try:
-            if mitogen.core.PY3:
+            if sys.version_info >= (3, 0):
                 exec(code, vars(mod))
             else:
                 exec('exec code in vars(mod)')
@@ -1020,12 +1030,12 @@ class NewStyleRunner(ScriptRunner):
         pkg, sep, _ = self.py_module_name.rpartition('.')
         if not sep:
             return None
-        if mitogen.core.PY3:
+        if sys.version_info >= (3, 0):
             return pkg
         return pkg.encode()
 
     def _run(self):
-        mod = types.ModuleType(self.main_module_name)
+        mod = types.ModuleType('__main__')
         mod.__package__ = self._get_module_package()
         # Some Ansible modules use __file__ to find the Ansiballz temporary
         # directory. We must provide some temporary path in __file__, but we
@@ -1036,6 +1046,15 @@ class NewStyleRunner(ScriptRunner):
             'ansible_module_' + os.path.basename(self.path),
         )
 
+        if sys.version_info >= (3, 4):
+            mod.__spec__ = importlib.machinery.ModuleSpec(
+                self.py_module_name,
+                self, # FIXME Not an importlib Finder/Loader
+            )
+
+        mitogen.parent.upgrade_router(self.econtext)
+        mod.ansible_mitogen_injected_router = self.econtext.router
+        sys.modules['__main__'] = mod
         code = self._get_code()
         rc = 2
         try:

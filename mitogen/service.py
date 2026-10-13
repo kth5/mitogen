@@ -52,7 +52,7 @@ _pool_pid = None
 _pool_lock = threading.Lock()
 
 
-if mitogen.core.PY3:
+if sys.version_info >= (3, 0):
     def func_code(func):
         return func.__code__
     def func_name(func):
@@ -523,7 +523,7 @@ class Pool(object):
             self.add(service)
         self._py_24_25_compat()
         self._threads = []
-        for x in range(size):
+        for x in mitogen.core.range(size):
             name = 'mitogen.Pool.%04x.%d' % (id(self) & 0xffff, x,)
             thread = threading.Thread(
                 name=name,
@@ -974,14 +974,8 @@ class FileService(Service):
 
     # The IO loop pumps 128KiB chunks. An ideal message is a multiple of this,
     # odd-sized messages waste one tiny write() per message on the trailer.
-    # Therefore subtract 10 bytes pickle overhead + 24 bytes header.
-    IO_SIZE = mitogen.core.CHUNK_SIZE - (mitogen.core.Message.HEADER_LEN + (
-        len(
-            mitogen.core.Message.pickled(
-                mitogen.core.Blob(b(' ') * mitogen.core.CHUNK_SIZE)
-            ).data
-        ) - mitogen.core.CHUNK_SIZE
-    ))
+    # Therefore subtract encoding overhead and Message header size.
+    IO_SIZE = mitogen.core.CHUNK_SIZE - mitogen.core.Message.HEADER_LEN
 
     def _schedule_pending_unlocked(self, state):
         """
@@ -997,7 +991,7 @@ class FileService(Service):
             s = fp.read(self.IO_SIZE)
             if s:
                 state.unacked += len(s)
-                sender.send(mitogen.core.Blob(s))
+                sender.send(s, mitogen.core.Message.ENC_BIN)
             else:
                 # File is done. Cause the target's receive loop to exit by
                 # closing the sender, close the file, and remove the job entry.
@@ -1145,8 +1139,8 @@ class FileService(Service):
         )
 
         received_bytes = 0
-        for chunk in recv:
-            s = chunk.unpickle()
+        for msg in recv:
+            s = msg.decode()
             LOG.debug('get_file(%r): received %d bytes', path, len(s))
             context.call_service_async(
                 service_name=cls.name(),

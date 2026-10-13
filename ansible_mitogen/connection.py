@@ -43,11 +43,11 @@ import ansible.errors
 import ansible.plugins.connection
 
 import mitogen.core
+import mitogen.parent
+import mitogen.service
 
 import ansible_mitogen.mixins
-import ansible_mitogen.parsing
 import ansible_mitogen.process
-import ansible_mitogen.services
 import ansible_mitogen.target
 import ansible_mitogen.transport_config
 import ansible_mitogen.utils.unsafe
@@ -256,6 +256,22 @@ def _connect_lxd(spec):
     }
 
 
+def _connect_incus(spec):
+    """
+    Return ContextService arguments for an Incus container connection.
+    """
+    return {
+        'method': 'incus',
+        'kwargs': {
+            'container': spec.remote_addr(),
+            'python_path': spec.python_path(),
+            'incus_path': spec.mitogen_incus_path(),
+            'connect_timeout': spec.timeout(),
+            'remote_name': get_remote_name(spec),
+        }
+    }
+
+
 def _connect_machinectl(spec):
     """
     Return ContextService arguments for a machinectl connection.
@@ -409,11 +425,13 @@ def _connect_mitogen_doas(spec):
 #: generating ContextService keyword arguments matching a connection
 #: specification.
 CONNECTION_METHOD = {
+    # Ansible connection plugins
     'buildah': _connect_buildah,
     'docker': _connect_docker,
     'kubectl': _connect_kubectl,
     'jail': _connect_jail,
     'local': _connect_local,
+    'incus': _connect_incus,
     'lxc': _connect_lxc,
     'lxd': _connect_lxd,
     'machinectl': _connect_machinectl,
@@ -421,9 +439,14 @@ CONNECTION_METHOD = {
     'setns': _connect_setns,
     'ssh': _connect_ssh,
     'smart': _connect_ssh,  # issue #548.
+
+    # Ansible become plugins
+    'community.general.doas': _connect_doas,
     'su': _connect_su,
     'sudo': _connect_sudo,
     'doas': _connect_doas,
+
+    # Mitogen specific methods
     'mitogen_su': _connect_mitogen_su,
     'mitogen_sudo': _connect_mitogen_sudo,
     'mitogen_doas': _connect_mitogen_doas,

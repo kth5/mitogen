@@ -12,6 +12,7 @@ import mitogen.master
 import testlib
 
 from mitogen.core import b
+from mitogen.core import next
 
 
 class ConstructorTest(testlib.TestCase):
@@ -59,9 +60,14 @@ class ConstructorTest(testlib.TestCase):
         self.assertEqual(m.data, b('asdf'))
         self.assertIsInstance(m.data, mitogen.core.BytesType)
 
-    def test_data_hates_unicode(self):
+    def test_enc(self):
+        self.assertEqual(self.klass().enc, self.klass.ENC_MGC)
+        self.assertEqual(self.klass(enc=self.klass.ENC_PKL).enc, self.klass.ENC_PKL)
+
+    def test_invalid_args(self):
         self.assertRaises(Exception,
             lambda: self.klass(data=u'asdf'))
+        self.assertRaises(ValueError, lambda: self.klass(enc=42))
 
 
 class PackTest(testlib.TestCase):
@@ -75,10 +81,10 @@ class PackTest(testlib.TestCase):
         s = self.klass(dst_id=123, handle=123).pack()
         self.assertEqual(len(s), self.klass.HEADER_LEN)
 
-    def test_magic(self):
+    def test_enc(self):
         s = self.klass(dst_id=123, handle=123).pack()
-        magic, = struct.unpack('>h', s[:2])
-        self.assertEqual(self.klass.HEADER_MAGIC, magic)
+        enc, = struct.unpack('>h', s[:2])
+        self.assertEqual(self.klass.ENC_MGC, enc)
 
     def test_dst_id(self):
         s = self.klass(dst_id=123, handle=123).pack()
@@ -158,13 +164,32 @@ class EvilObject(object):
     pass
 
 
+class EncodedTest(testlib.TestCase):
+    klass = mitogen.core.Message
+    def test_ctor(self):
+        msg = self.klass.encoded(42, self.klass.ENC_PKL)
+        self.assertEqual(self.klass.ENC_PKL, msg.enc)
+
+        msg = self.klass.encoded(b'abc', self.klass.ENC_BIN)
+        self.assertEqual(b'abc', msg.data)
+        self.assertEqual(self.klass.ENC_BIN, msg.enc)
+
+    def test_invalid_args(self):
+        self.assertRaises(ValueError, lambda: self.klass.encoded(42, enc=self.klass.ENC_MGC))
+        self.assertRaises(ValueError, lambda: self.klass.encoded(b('abc'), enc=self.klass.ENC_MGC))
+        self.assertRaises(Exception, lambda: self.klass.encoded(42, enc=self.klass.ENC_BIN))
+        self.assertRaises(Exception, lambda: self.klass.encoded(u'abc', enc=self.klass.ENC_BIN))
+
+
 class PickledTest(testlib.TestCase):
     # getting_started.html#rpc-serialization-rules
     klass = mitogen.core.Message
 
     def roundtrip(self, v, router=None):
         msg = self.klass.pickled(v)
+        self.assertEqual(self.klass.ENC_PKL, msg.enc)
         msg2 = self.klass(data=msg.data)
+        self.assertEqual(self.klass.ENC_MGC, msg2.enc)
         msg2.router = router
         return msg2.unpickle()
 
@@ -293,6 +318,30 @@ class PickledTest(testlib.TestCase):
         )
 
 
+class UnpickleIterTest(testlib.TestCase):
+    def roundtrip(self, *args, **kwargs):
+        msg1 = mitogen.core.Message.pickled(*args, **kwargs)
+        return msg1.unpickle_iter()
+
+    def test_ints(self):
+        self.assertEqual(list(self.roundtrip(1, 2, 3)), [1, 2, 3])
+
+    def test_mixed(self):
+        msg = mitogen.core.Message.pickled((u'foo.bar', u'baz.txt'), b('abc'))
+        self.assertFalse(b('_codecs') in msg.data)
+        self.assertFalse(b('encode') in msg.data)
+        self.assertFalse(b('latin1') in msg.data)
+
+        parts = msg.unpickle_iter()
+        self.assertEqual(next(parts), (u'foo.bar', u'baz.txt'))
+        self.assertEqual(next(parts), b('abc'))
+        self.assertRaises(StopIteration, next, parts)
+
+    def test_default_find_class_denies(self):
+        msg = mitogen.core.Message.pickled(1j)
+        self.assertRaises(mitogen.core.UnpicklingError, next, msg.unpickle_iter())
+
+
 class ReplyTest(testlib.TestCase):
     # getting_started.html#rpc-serialization-rules
     klass = mitogen.core.Message
@@ -362,6 +411,11 @@ class UnpickleTest(testlib.TestCase):
         m = self.klass.pickled('derp', reply_to=mitogen.core.IS_DEAD)
         self.assertEqual('derp', m.unpickle(throw_dead=False))
 
+    def test_invalid_enc(self):
+        msg = self.klass.pickled(42)
+        msg.enc = self.klass.ENC_BIN
+        self.assertRaises(ValueError, msg.unpickle)
+
 
 class UnpickleCompatTest(testlib.TestCase):
     # try weird variations of pickles from different Python versions.
@@ -423,11 +477,13 @@ class UnpickleCompatTest(testlib.TestCase):
            ('\x80\x02cmitogen.core\n_unpickle_call_error\nq\x00X\t\x00\x00\x00big errorq\x01\x85q\x02R.'), throw=False)
 
     def test_py24_context(self):
-        self.check(mitogen.core.Context(1234, None),
+        self.check(
+            mitogen.core.Context(object(), 1234, None),
            ('\x80\x02cmitogen.core\n_unpickle_context\nq\x00M\xd2\x04N\x86q\x01Rq\x02.'))
 
     def test_py24_sender(self):
-        self.check(mitogen.core.Sender(mitogen.core.Context(55555, None), 4444),
+        self.check(
+            mitogen.core.Sender(mitogen.core.Context(object(), 55555, None), 4444),
            ('\x80\x02cmitogen.core\n_unpickle_sender\nq\x00M\x03\xd9M\\\x11\x86q\x01Rq\x02.'))
 
     def test_py27_bytes(self):
@@ -475,11 +531,13 @@ class UnpickleCompatTest(testlib.TestCase):
            ('\x80\x02cmitogen.core\n_unpickle_call_error\nq\x01X\t\x00\x00\x00big errorq\x02\x85Rq\x03.'), throw=False)
 
     def test_py27_context(self):
-        self.check(mitogen.core.Context(1234, None),
+        self.check(
+            mitogen.core.Context(object(), 1234, None),
            ('\x80\x02cmitogen.core\n_unpickle_context\nq\x01M\xd2\x04N\x86Rq\x02.'))
 
     def test_py27_sender(self):
-        self.check(mitogen.core.Sender(mitogen.core.Context(55555, None), 4444),
+        self.check(
+            mitogen.core.Sender(mitogen.core.Context(object(), 55555, None), 4444),
            ('\x80\x02cmitogen.core\n_unpickle_sender\nq\x01M\x03\xd9M\\\x11\x86Rq\x02.'))
 
     def test_py36_bytes(self):
@@ -527,11 +585,13 @@ class UnpickleCompatTest(testlib.TestCase):
            ('\x80\x02cmitogen.core\n_unpickle_call_error\nq\x00X\t\x00\x00\x00big errorq\x01\x85q\x02Rq\x03.'), throw=False)
 
     def test_py36_context(self):
-        self.check(mitogen.core.Context(1234, None),
+        self.check(
+            mitogen.core.Context(object(), 1234, None),
            ('\x80\x02cmitogen.core\n_unpickle_context\nq\x00M\xd2\x04N\x86q\x01Rq\x02.'))
 
     def test_py36_sender(self):
-        self.check(mitogen.core.Sender(mitogen.core.Context(55555, None), 4444),
+        self.check(
+            mitogen.core.Sender(mitogen.core.Context(object(), 55555, None), 4444),
            ('\x80\x02cmitogen.core\n_unpickle_sender\nq\x00M\x03\xd9M\\\x11\x86q\x01Rq\x02.'))
 
 

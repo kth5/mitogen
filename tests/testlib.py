@@ -1,21 +1,14 @@
 import errno
-import io
 import logging
 import os
 import random
 import re
 import socket
-import stat
 import sys
 import threading
 import time
 import traceback
 import unittest
-
-try:
-    import configparser
-except ImportError:
-    import ConfigParser as configparser
 
 import psutil
 if sys.version_info < (3, 0):
@@ -53,98 +46,40 @@ LOG = logging.getLogger(__name__)
 
 DISTRO_SPECS = os.environ.get(
     'MITOGEN_TEST_DISTRO_SPECS',
-    'centos6 centos8 debian9 debian11 ubuntu1604 ubuntu2004',
+    'alma9-py3 centos5 centos8-py3 debian9 debian12-py3 ubuntu1604 ubuntu2604-py3',
 )
 IMAGE_TEMPLATE = os.environ.get(
     'MITOGEN_TEST_IMAGE_TEMPLATE',
-    'ghcr.io/mitogen-hq/%(distro)s-test:2021',
+    'ghcr.io/mitogen-hq/%(distro)s-test:2026.04',
 )
+SKIP_CONTAINER_TESTS = os.environ.get('MITOGEN_TEST_SKIP_CONTAINER_TESTS')
 
 TESTS_DIR =                     os.path.join(os.path.dirname(__file__))
-ANSIBLE_LIB_DIR =               os.path.join(TESTS_DIR, 'ansible', 'lib')
-ANSIBLE_MODULE_UTILS_DIR =      os.path.join(TESTS_DIR, 'ansible', 'lib', 'module_utils')
-ANSIBLE_MODULES_DIR =           os.path.join(TESTS_DIR, 'ansible', 'lib', 'modules')
 DATA_DIR =                      os.path.join(TESTS_DIR, 'data')
-MODS_DIR =                      os.path.join(TESTS_DIR, 'data', 'importer')
+TESTMODS_DIR =                  os.path.join(TESTS_DIR, 'testmods')
 
-sys.path.append(DATA_DIR)
-sys.path.append(MODS_DIR)
-
-
-if mitogen.is_master:
+if mitogen.is_master and 'MITOGEN_LOG_LEVEL' in os.environ:
     mitogen.utils.log_to_file()
 
 if faulthandler is not None:
     faulthandler.enable()
 
 
-#
-# Temporary hack: Operon changed logging somewhat, and this broke LogCapturer /
-# log_handler_test.
-#
+def wait_for_child(pid, timeout=1.0):
+    deadline = mitogen.core.now() + timeout
+    while timeout < mitogen.core.now():
+        try:
+            target_pid, status = os.waitpid(pid, os.WNOHANG)
+            if target_pid == pid:
+                return
+        except OSError:
+            e = sys.exc_info()[1]
+            if e.args[0] == errno.ECHILD:
+                return
 
-mitogen.core.LOG.propagate = True
+        time.sleep(0.05)
 
-
-def base_executable(executable=None):
-    '''Return the path of the Python executable used to create the virtualenv.
-    '''
-    # https://docs.python.org/3/library/venv.html
-    # https://github.com/pypa/virtualenv/blob/main/src/virtualenv/discovery/py_info.py
-    # https://virtualenv.pypa.io/en/16.7.9/reference.html#compatibility-with-the-stdlib-venv-module
-    if executable is None:
-        executable = sys.executable
-
-    if not executable:
-        raise ValueError
-
-    try:
-        base_executable = sys._base_executable
-    except AttributeError:
-        base_executable = None
-
-    if base_executable and base_executable != executable:
-        return base_executable
-
-    # Python 2.x only has sys.base_prefix if running outside a virtualenv.
-    try:
-        sys.base_prefix
-    except AttributeError:
-        # Python 2.x outside a virtualenv
-        return executable
-
-    # Python 3.3+ has sys.base_prefix. In a virtualenv it differs to sys.prefix.
-    if sys.base_prefix == sys.prefix:
-        return executable
-
-    while executable.startswith(sys.prefix) and stat.S_ISLNK(os.lstat(executable).st_mode):
-        dirname = os.path.dirname(executable)
-        target = os.path.join(dirname, os.readlink(executable))
-        executable = os.path.abspath(os.path.normpath(target))
-        print(executable)
-
-    if executable.startswith(sys.base_prefix):
-        return executable
-
-    # Virtualenvs record details in pyvenv.cfg
-    parser = configparser.RawConfigParser()
-    with io.open(os.path.join(sys.prefix, 'pyvenv.cfg'), encoding='utf-8') as f:
-        content = u'[virtualenv]\n' + f.read()
-    try:
-        parser.read_string(content)
-    except AttributeError:
-        parser.readfp(io.StringIO(content))
-
-    # virtualenv style pyvenv.cfg includes the base executable.
-    # venv style pyvenv.cfg doesn't.
-    try:
-        return parser.get(u'virtualenv', u'base-executable')
-    except configparser.NoOptionError:
-        pass
-
-    basename = os.path.basename(executable)
-    home = parser.get(u'virtualenv', u'home')
-    return os.path.join(home, basename)
+    assert False, "wait_for_child() timed out"
 
 
 def data_path(suffix):
@@ -156,10 +91,10 @@ def data_path(suffix):
 
 
 def _have_cmd(args):
-    # Code duplicated in ci_lib.py
     try:
         subprocess.run(
             args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=True,
         )
     except OSError as exc:
         if exc.errno == errno.ENOENT:
@@ -171,11 +106,20 @@ def _have_cmd(args):
 
 
 def have_python2():
-    return _have_cmd(['python2'])
+    return _have_cmd(['python2', '--version'])
 
 
 def have_python3():
-    return _have_cmd(['python3'])
+    return _have_cmd(['python3', '--version'])
+
+
+def have_sudo_nopassword():
+    """
+    Return True if we can run `sudo` with no password, otherwise False.
+
+    Any cached credentials are ignored.
+    """
+    return _have_cmd(['sudo', '-kn', 'true'])
 
 
 def retry(fn, on, max_attempts, delay):
@@ -372,29 +316,19 @@ def log_fd_calls():
     os.dup = dup
 
 
-class CaptureStreamHandler(logging.StreamHandler):
-    def __init__(self, *args, **kwargs):
-        logging.StreamHandler.__init__(self, *args, **kwargs)
-        self.msgs = []
-
-    def emit(self, msg):
-        self.msgs.append(msg)
-        logging.StreamHandler.emit(self, msg)
-
-
 class LogCapturer(object):
-    def __init__(self, name=None):
+    def __init__(self, name=None, formatter=None):
         self.sio = StringIO()
         self.logger = logging.getLogger(name)
-        self.handler = CaptureStreamHandler(self.sio)
-        self.old_propagate = self.logger.propagate
-        self.old_handlers = self.logger.handlers
+        handler = logging.StreamHandler(self.sio)
+        if formatter is not None:
+            handler.setFormatter(formatter)
+        self.handler = handler
         self.old_level = self.logger.level
 
     def start(self):
-        self.logger.handlers = [self.handler]
-        self.logger.propagate = False
-        self.logger.level = logging.DEBUG
+        self.logger.addHandler(self.handler)
+        self.logger.setLevel(logging.DEBUG)
 
     def raw(self):
         s = self.sio.getvalue()
@@ -402,9 +336,6 @@ class LogCapturer(object):
         if isinstance(s, mitogen.core.BytesType):
             s = s.decode('utf-8')
         return s
-
-    def msgs(self):
-        return self.handler.msgs
 
     def __enter__(self):
         self.start()
@@ -414,9 +345,8 @@ class LogCapturer(object):
         self.stop()
 
     def stop(self):
-        self.logger.level = self.old_level
-        self.logger.handlers = self.old_handlers
-        self.logger.propagate = self.old_propagate
+        self.logger.setLevel(self.old_level)
+        self.logger.removeHandler(self.handler)
         return self.raw()
 
 
@@ -525,6 +455,10 @@ class TestCase(unittest.TestCase):
         self._teardown_check_fds()
         super(TestCase, self).tearDown()
 
+    def assertIsType(self, a, expected_type):
+        if type(a) is not expected_type:
+            self.fail("Expected type %s, got %s" % (expected_type, type(a)))
+
     def assertRaises(self, exc, func, *args, **kwargs):
         """Like regular assertRaises, except return the exception that was
         raised. Can't use context manager because tests must run on Python2.4"""
@@ -565,11 +499,6 @@ class DockerizedSshDaemon(object):
         return int(m.group('port'))
 
     def start_container(self):
-        try:
-            subprocess.check_output(['docker', '--version'])
-        except Exception:
-            raise unittest.SkipTest('Docker binary is unavailable')
-
         self.container_name = 'mitogen-test-%08x' % (random.getrandbits(64),)
         args = [
             'docker',
@@ -672,9 +601,9 @@ class RouterMixin(BrokerMixin):
 class DockerMixin(RouterMixin):
     @classmethod
     def setUpClass(cls):
+        if SKIP_CONTAINER_TESTS:
+            raise unittest.SkipTest('SKIP_CONTAINER_TESTS is set')
         super(DockerMixin, cls).setUpClass()
-        if os.environ.get('SKIP_DOCKER_TESTS'):
-            raise unittest.SkipTest('SKIP_DOCKER_TESTS is set')
 
         # cls.dockerized_ssh is injected by dynamically generating TestCase
         # subclasses.
@@ -712,6 +641,7 @@ class DockerMixin(RouterMixin):
             #   - tests/testlib.py
             'ssh_args': [
                 '-o', 'HostKeyAlgorithms +ssh-rsa',
+                '-o', 'KexAlgorithms +diffie-hellman-group1-sha1',
                 '-o', 'PubkeyAcceptedKeyTypes +ssh-rsa',
             ],
             'python_path': self.dockerized_ssh.python_path,

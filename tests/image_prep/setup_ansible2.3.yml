@@ -1,0 +1,23 @@
+#!/usr/bin/env ansible-playbook
+
+- name: Run containers
+  hosts: all
+  gather_facts: false
+  pre_tasks:
+    - name: Fetch container base images
+      docker_image:
+        name: "{{ docker_base }}"
+      delegate_to: localhost
+  roles:
+    - role: container_start_cmd
+    - role: container_wait
+
+- include: _container_setup.yml
+- include: _user_accounts.yml
+
+- name: Finalize containers
+  hosts: all
+  gather_facts: false
+  roles:
+    - role: container_commit
+    - role: container_stop_cmd

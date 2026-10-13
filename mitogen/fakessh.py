@@ -97,7 +97,6 @@ import inspect
 import os
 import pty
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -179,6 +178,9 @@ class Process(object):
         self.control_handle = router.add_handler(self._on_control)
         self.stdin_handle = router.add_handler(self._on_stdin)
         self.pump = IoPump.build_stream(router.broker)
+        for fp in stdin, stdout:
+            fd = fp.fileno()
+            mitogen.core.set_blocking(fd, False)
         self.pump.accept(stdin, stdout)
         self.stdin = None
         self.control = None
@@ -374,7 +376,7 @@ def _get_econtext_config(context, sock2):
         'core_src_fd': None,
         'debug': getattr(context.router, 'debug', False),
         'in_fd': sock2.fileno(),
-        'log_level': mitogen.parent.get_log_level(),
+        'log_levels': mitogen.parent.get_log_levels(),
         'max_message_size': context.router.max_message_size,
         'out_fd': sock2.fileno(),
         'parent_ids': parent_ids,
@@ -419,10 +421,11 @@ def run(dest, router, args, deadline=None, econtext=None):
     fakessh = mitogen.parent.Context(router, context_id)
     fakessh.name = u'fakessh.%d' % (context_id,)
 
-    sock1, sock2 = socket.socketpair()
+    sock1, sock2 = mitogen.core.socketpair()
 
     stream = mitogen.core.Stream(router, context_id)
     stream.name = u'fakessh'
+    mitogen.core.set_blocking(sock1.fileno(), False)
     stream.accept(sock1, sock1)
     router.register(fakessh, stream)
 

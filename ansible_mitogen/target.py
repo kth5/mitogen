@@ -40,7 +40,6 @@ import errno
 import grp
 import json
 import logging
-import operator
 import os
 import pty
 import pwd
@@ -51,22 +50,12 @@ import subprocess
 import sys
 import tempfile
 import traceback
-import types
 
 import mitogen.core
 import mitogen.parent
 import mitogen.service
 
-# Ansible since PR #41749 inserts "import __main__" into
-# ansible.module_utils.basic. Mitogen's importer will refuse such an import, so
-# we must setup a fake "__main__" before that module is ever imported. The
-# str() is to cast Unicode to bytes on Python 2.6.
-if not sys.modules.get(str('__main__')):
-    sys.modules[str('__main__')] = types.ModuleType(str('__main__'))
-
 import ansible.module_utils.json_utils
-
-from ansible.module_utils.six.moves import reduce
 
 import ansible_mitogen.runner
 
@@ -75,8 +64,7 @@ LOG = logging.getLogger(__name__)
 
 MAKE_TEMP_FAILED_MSG = (
     u"Unable to find a useable temporary directory. This likely means no\n"
-    u"system-supplied TMP directory can be written to, or all directories\n"
-    u"were mounted on 'noexec' filesystems.\n"
+    u"system-supplied TMP directory can be written to.\n"
     u"\n"
     u"The following paths were tried:\n"
     u"    %(paths)s\n"
@@ -272,21 +260,11 @@ def is_good_temp_dir(path):
         return False
 
     try:
-        try:
-            os.chmod(tmp.name, int('0700', 8))
-        except OSError:
-            e = sys.exc_info()[1]
-            LOG.debug('temp dir %r unusable: chmod failed: %s', path, e)
-            return False
-
-        try:
-            # access(.., X_OK) is sufficient to detect noexec.
-            if not os.access(tmp.name, os.X_OK):
-                raise OSError('filesystem appears to be mounted noexec')
-        except OSError:
-            e = sys.exc_info()[1]
-            LOG.debug('temp dir %r unusable: %s', path, e)
-            return False
+        os.chmod(tmp.name, int('0700', 8))
+    except OSError:
+        e = sys.exc_info()[1]
+        LOG.debug('temp dir %r unusable: chmod failed: %s', path, e)
+        return False
     finally:
         tmp.close()
 
@@ -297,8 +275,8 @@ def find_good_temp_dir(candidate_temp_dirs):
     """
     Given a list of candidate temp directories extracted from ``ansible.cfg``,
     combine it with the Python-builtin list of candidate directories used by
-    :mod:`tempfile`, then iteratively try each until one is found that is both
-    writeable and executable.
+    :mod:`tempfile`, then iteratively try each until one is found that is
+    writeable.
 
     :param list candidate_temp_dirs:
         List of candidate $variable-expanded and tilde-expanded directory paths
@@ -390,7 +368,8 @@ def spawn_isolated_child(econtext):
     return context
 
 
-def run_module(kwargs):
+@mitogen.core.takes_econtext
+def run_module(kwargs, econtext):
     """
     Set up the process environment in preparation for running an Ansible
     module. This monkey-patches the Ansible libraries in various places to
@@ -399,7 +378,7 @@ def run_module(kwargs):
     """
     runner_name = kwargs.pop('runner_name')
     klass = getattr(ansible_mitogen.runner, runner_name)
-    impl = klass(**mitogen.core.Kwargs(kwargs))
+    impl = klass(econtext=econtext, **mitogen.core.Kwargs(kwargs))
     return impl.run()
 
 
@@ -463,10 +442,9 @@ class AsyncRunner(object):
     def _run_module(self):
         kwargs = dict(self.kwargs, **{
             'detach': True,
-            'econtext': self.econtext,
             'emulate_tty': False,
         })
-        return run_module(kwargs)
+        return run_module(kwargs, self.econtext)
 
     def _parse_result(self, dct):
         filtered, warnings = (
@@ -718,7 +696,9 @@ def apply_mode_spec(spec, mode):
             mask = CHMOD_MASKS[ch]
             bits = CHMOD_BITS[ch]
             cur_perm_bits = mode & mask
-            new_perm_bits = reduce(operator.or_, (bits[p] for p in perms), 0)
+            new_perm_bits = 0
+            for perm in perms:
+                new_perm_bits |= bits[perm]
             mode &= ~mask
             if op == '=':
                 mode |= new_perm_bits

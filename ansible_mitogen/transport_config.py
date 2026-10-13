@@ -69,17 +69,30 @@ import ansible.utils.shlex
 import ansible.constants as C
 import ansible.executor.interpreter_discovery
 import ansible.utils.unsafe_proxy
-
-from ansible.module_utils.six import with_metaclass
 from ansible.module_utils.parsing.convert_bool import boolean
+
+import ansible_mitogen.utils
+from ansible_mitogen.compat.six import with_metaclass
 
 import mitogen.core
 
 
 LOG = logging.getLogger(__name__)
 
+if ansible_mitogen.utils.ansible_version[:2] >= (2, 21):
+    _INTERPRETER_DISCOVERY_MODES = frozenset(['auto', 'auto_silent'])
+else:
+    _INTERPRETER_DISCOVERY_MODES = frozenset(['auto', 'auto_legacy', 'auto_silent', 'auto_legacy_silent'])
 
-def run_interpreter_discovery_if_necessary(s, task_vars, action, rediscover_python):
+if ansible_mitogen.utils.ansible_version[:2] >= (2, 19):
+    _FALLBACK_INTERPRETER = ansible.executor.interpreter_discovery._FALLBACK_INTERPRETER
+elif ansible_mitogen.utils.ansible_version[:2] >= (2, 17):
+    _FALLBACK_INTERPRETER = u'/usr/bin/python3'
+else:
+    _FALLBACK_INTERPRETER = u'/usr/bin/python'
+
+
+def run_interpreter_discovery_if_necessary(s, candidates, task_vars, action, rediscover_python):
     """
     Triggers ansible python interpreter discovery if requested.
     Caches this value the same way Ansible does it.
@@ -90,7 +103,7 @@ def run_interpreter_discovery_if_necessary(s, task_vars, action, rediscover_pyth
     if action._mitogen_discovering_interpreter:
         return action._mitogen_interpreter_candidate
 
-    if s in ['auto', 'auto_legacy', 'auto_silent', 'auto_legacy_silent']:
+    if s in _INTERPRETER_DISCOVERY_MODES:
         # python is the only supported interpreter_name as of Ansible 2.8.8
         interpreter_name = 'python'
         discovered_interpreter_config = u'discovered_interpreter_%s' % interpreter_name
@@ -110,8 +123,11 @@ def run_interpreter_discovery_if_necessary(s, task_vars, action, rediscover_pyth
             # blow away the discovered_interpreter_config cache and rediscover
             del task_vars['ansible_facts'][discovered_interpreter_config]
 
-        if discovered_interpreter_config not in task_vars['ansible_facts']:
+        try:
+            s = task_vars[u'ansible_facts'][discovered_interpreter_config]
+        except KeyError:
             action._mitogen_discovering_interpreter = True
+            action._mitogen_interpreter_candidates = candidates
             # fake pipelining so discover_interpreter can be happy
             action._connection.has_pipelining = True
             s = ansible.executor.interpreter_discovery.discover_interpreter(
@@ -124,18 +140,17 @@ def run_interpreter_discovery_if_necessary(s, task_vars, action, rediscover_pyth
             # cache discovered interpreter
             task_vars['ansible_facts'][discovered_interpreter_config] = s
             action._connection.has_pipelining = False
-        else:
-            s = task_vars['ansible_facts'][discovered_interpreter_config]
 
         # propagate discovered interpreter as fact
         action._discovered_interpreter_key = discovered_interpreter_config
         action._discovered_interpreter = s
 
     action._mitogen_discovering_interpreter = False
+    action._mitogen_interpreter_candidates = None
     return s
 
 
-def parse_python_path(s, task_vars, action, rediscover_python):
+def parse_python_path(s, candidates, task_vars, action, rediscover_python):
     """
     Given the string set for ansible_python_interpeter, parse it using shell
     syntax and return an appropriate argument vector. If the value detected is
@@ -146,10 +161,9 @@ def parse_python_path(s, task_vars, action, rediscover_python):
         # if python_path doesn't exist, default to `auto` and attempt to discover it
         s = 'auto'
 
-    s = run_interpreter_discovery_if_necessary(s, task_vars, action, rediscover_python)
-    # if unable to determine python_path, fallback to '/usr/bin/python'
+    s = run_interpreter_discovery_if_necessary(s, candidates, task_vars, action, rediscover_python)
     if not s:
-        s = '/usr/bin/python'
+        s = _FALLBACK_INTERPRETER
 
     return ansible.utils.shlex.shlex_split(s)
 
@@ -344,6 +358,12 @@ class Spec(with_metaclass(abc.ABCMeta, object)):
         """
 
     @abc.abstractmethod
+    def mitogen_incus_path(self):
+        """
+        The path to the "incus" program for the 'incus' transport.
+        """
+
+    @abc.abstractmethod
     def mitogen_lxc_path(self):
         """
         The path to the "lxc" program for the 'lxd' transport.
@@ -513,6 +533,9 @@ class PlayContextSpec(Spec):
         interpreter_python = C.config.get_config_value(
             'INTERPRETER_PYTHON', variables=variables,
         )
+        interpreter_python_fallback = C.config.get_config_value(
+            'INTERPRETER_PYTHON_FALLBACK', variables=variables,
+        )
 
         if '{{' in interpreter_python or '{%' in interpreter_python:
             templar = self._connection.templar
@@ -520,6 +543,7 @@ class PlayContextSpec(Spec):
 
         return parse_python_path(
             interpreter_python,
+            candidates=interpreter_python_fallback,
             task_vars=self._task_vars,
             action=self._action,
             rediscover_python=rediscover_python)
@@ -573,6 +597,9 @@ class PlayContextSpec(Spec):
 
     def mitogen_kubectl_path(self):
         return self._connection.get_task_var('mitogen_kubectl_path')
+
+    def mitogen_incus_path(self):
+        return self._connection.get_task_var('mitogen_incus_path')
 
     def mitogen_lxc_path(self):
         return self._connection.get_task_var('mitogen_lxc_path')
@@ -735,11 +762,12 @@ class MitogenViaSpec(Spec):
 
     def python_path(self, rediscover_python=False):
         s = self._host_vars.get('ansible_python_interpreter')
-        # #511, #536: executor/module_common.py::_get_shebang() hard-wires
-        # "/usr/bin/python" as the default interpreter path if no other
-        # interpreter is specified.
+        interpreter_python_fallback = self._host_vars.get(
+            'ansible_interpreter_python_fallback', [],
+        )
         return parse_python_path(
             s,
+            candidates=interpreter_python_fallback,
             task_vars=self._task_vars,
             action=self._action,
             rediscover_python=rediscover_python)
@@ -820,6 +848,9 @@ class MitogenViaSpec(Spec):
 
     def mitogen_kubectl_path(self):
         return self._host_vars.get('mitogen_kubectl_path')
+
+    def mitogen_incus_path(self):
+        return self._host_vars.get('mitogen_incus_path')
 
     def mitogen_lxc_path(self):
         return self._host_vars.get('mitogen_lxc_path')

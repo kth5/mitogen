@@ -8,11 +8,12 @@ try:
 except ImportError:
     import mock
 
+import mitogen.core
 import mitogen.master
-import testlib
 
-import plain_old_module
-import simple_pkg.a
+import testlib
+import testmod_toplevel
+import testmods.simple_pkg.a
 
 
 class NeutralizeMainTest(testlib.RouterMixin, testlib.TestCase):
@@ -20,7 +21,8 @@ class NeutralizeMainTest(testlib.RouterMixin, testlib.TestCase):
 
     def call(self, *args, **kwargs):
         router = mock.Mock()
-        return self.klass(router).neutralize_main(*args, **kwargs)
+        policy = mock.Mock()
+        return self.klass(router, policy).neutralize_main(*args, **kwargs)
 
     def test_missing_exec_guard(self):
         path = testlib.data_path('main_with_no_exec_guard.py')
@@ -75,7 +77,7 @@ class GoodModulesTest(testlib.RouterMixin, testlib.TestCase):
         # package machinery damage.
         context = self.router.local()
 
-        self.assertEqual(256, context.call(plain_old_module.pow, 2, 8))
+        self.assertEqual(256, context.call(testmod_toplevel.pow, 2, 8))
         os_fork = int(sys.version_info < (2, 6))  # mitogen.os_fork
         self.assertEqual(1+os_fork, self.router.responder.get_module_count)
         self.assertEqual(1+os_fork, self.router.responder.good_load_module_count)
@@ -86,10 +88,10 @@ class GoodModulesTest(testlib.RouterMixin, testlib.TestCase):
         # which imports the other.
         context = self.router.local()
         self.assertEqual(3,
-            context.call(simple_pkg.a.subtract_one_add_two, 2))
+            context.call(testmods.simple_pkg.a.subtract_one_add_two, 2))
         os_fork = int(sys.version_info < (2, 6))  # mitogen.os_fork
-        self.assertEqual(2+os_fork, self.router.responder.get_module_count)
-        self.assertEqual(3+os_fork, self.router.responder.good_load_module_count)
+        self.assertEqual(3+os_fork, self.router.responder.get_module_count)
+        self.assertEqual(4+os_fork, self.router.responder.good_load_module_count)
         self.assertEqual(0, self.router.responder.bad_load_module_count)
         self.assertLess(450, self.router.responder.good_load_module_size)
 
@@ -119,7 +121,8 @@ class BrokenModulesTest(testlib.TestCase):
         )
         msg.router = router
 
-        responder = mitogen.master.ModuleResponder(router)
+        policy = mock.Mock()
+        responder = mitogen.master.ModuleResponder(router, policy)
         responder._on_get_module(msg)
         self.assertEqual(1, len(router._async_route.mock_calls))
 
@@ -144,7 +147,7 @@ class BrokenModulesTest(testlib.TestCase):
         # finding its submodules. After ansible.compat.six is initialized in
         # the parent, attempts to execute six/__init__.py on the slave will
         # cause an attempt to request ansible.compat.six._six from the master.
-        import six_brokenpkg
+        import testmods.six_brokenpkg
 
         stream = mock.Mock()
         stream.protocol.sent_modules = set()
@@ -152,12 +155,13 @@ class BrokenModulesTest(testlib.TestCase):
         router.stream_by_id = lambda n: stream
 
         msg = mitogen.core.Message(
-            data=mitogen.core.b('six_brokenpkg._six'),
+            data=mitogen.core.b('testmods.six_brokenpkg._six'),
             reply_to=50,
         )
         msg.router = router
 
-        responder = mitogen.master.ModuleResponder(router)
+        policy = mock.Mock()
+        responder = mitogen.master.ModuleResponder(router, policy)
         responder._on_get_module(msg)
         self.assertEqual(1, len(router._async_route.mock_calls))
 
@@ -175,9 +179,9 @@ class BrokenModulesTest(testlib.TestCase):
 
 class ForwardTest(testlib.RouterMixin, testlib.TestCase):
     def test_forward_to_nonexistent_context(self):
-        nonexistent = mitogen.core.Context(self.router, 123)
         capture = testlib.LogCapturer()
         capture.start()
+        nonexistent = mitogen.core.Context(self.router, 123)
         self.broker.defer_sync(lambda:
             self.router.responder.forward_modules(
                 nonexistent,
@@ -193,26 +197,39 @@ class ForwardTest(testlib.RouterMixin, testlib.TestCase):
         c2 = self.router.local(via=c1)
 
         os_fork = int(sys.version_info < (2, 6))
-        self.assertEqual(256, c2.call(plain_old_module.pow, 2, 8))
+        self.assertEqual(256, c2.call(testmod_toplevel.pow, 2, 8))
         self.assertEqual(2+os_fork, self.router.responder.get_module_count)
         self.assertEqual(2+os_fork, self.router.responder.good_load_module_count)
         self.assertLess(10000, self.router.responder.good_load_module_size)
         self.assertGreater(40000, self.router.responder.good_load_module_size)
 
 
-class BlacklistTest(testlib.TestCase):
-    @unittest.skip('implement me')
-    def test_whitelist_no_blacklist(self):
-        assert 0
+class SourceModifierTest(testlib.RouterMixin, testlib.TestCase):
+    def modify_testmod_toplevel(self, fullname, path, source, is_pkg):
+        return (path, mitogen.core.b('def add(x, y): return 42\n'), is_pkg)
 
-    @unittest.skip('implement me')
-    def test_whitelist_has_blacklist(self):
-        assert 0
+    def test_toplevel_module(self):
+        self.router.responder.add_source_modifier(
+            'testmod_toplevel',
+            self.modify_testmod_toplevel,
+        )
 
-    @unittest.skip('implement me')
-    def test_blacklist_no_whitelist(self):
-        assert 0
+        ctx = self.router.local()
+        self.assertEqual(42, ctx.call(testmod_toplevel.add, 1, 1))
 
-    @unittest.skip('implement me')
-    def test_blacklist_has_whitelist(self):
-        assert 0
+        cached = self.router.responder._finder._found_cache['testmod_toplevel']
+        path, _, is_pkg = cached
+        self.assertEqual(path, testmod_toplevel.__file__.rstrip('co'))
+        self.assertEqual(is_pkg, False)
+
+
+class SourceOverrideTest(testlib.RouterMixin, testlib.TestCase):
+    def test_toplevel_module(self):
+        self.router.responder.add_source_override(
+            'testmod_toplevel',
+            '/land/of/make_believe',
+            mitogen.core.b('def pow(x, y): return 42\n'),
+            False,
+        )
+        ctx = self.router.local()
+        self.assertEqual(42, ctx.call(testmod_toplevel.pow, 1, 1))

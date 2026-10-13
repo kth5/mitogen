@@ -4,8 +4,8 @@ import os
 import sys
 import unittest
 
+import mitogen.core
 import mitogen.master
-from mitogen.core import b
 
 import testlib
 
@@ -50,6 +50,11 @@ class IsStdlibNameTest(testlib.TestCase):
         import mitogen.fakessh
         self.assertFalse(self.func('mitogen.fakessh'))
 
+    @unittest.skipIf(sys.version_info < (3, 3), 'Requires PEP 420 support')
+    def test_implicit_namespace_pkg(self):
+        import testmods.implicit_namespace_pkg.sub_pkg1
+        self.assertFalse(self.func('testmods.implicit_namespace_pkg'))
+
 
 class GetMainModuleDefectivePython3x(testlib.TestCase):
     klass = mitogen.master.DefectivePython3xMainMethod
@@ -85,24 +90,24 @@ class PkgutilMethodTest(testlib.TestCase):
         return self.klass().find(fullname)
 
     def test_empty_source_pkg(self):
-        path, src, is_pkg = self.call('module_finder_testmod')
+        path, src, is_pkg = self.call('testmods.module_finder_testmod')
         self.assertEqual(path,
-            os.path.join(testlib.MODS_DIR, 'module_finder_testmod/__init__.py'))
+            os.path.join(testlib.TESTMODS_DIR, 'module_finder_testmod/__init__.py'))
         self.assertEqual(mitogen.core.b(''), src)
         self.assertTrue(is_pkg)
 
     def test_empty_source_module(self):
-        path, src, is_pkg = self.call('module_finder_testmod.empty_mod')
+        path, src, is_pkg = self.call('testmods.module_finder_testmod.empty_mod')
         self.assertEqual(path,
-            os.path.join(testlib.MODS_DIR, 'module_finder_testmod/empty_mod.py'))
+            os.path.join(testlib.TESTMODS_DIR, 'module_finder_testmod/empty_mod.py'))
         self.assertEqual(mitogen.core.b(''), src)
         self.assertFalse(is_pkg)
 
     def test_regular_mod(self):
-        from module_finder_testmod import regular_mod
-        path, src, is_pkg = self.call('module_finder_testmod.regular_mod')
+        from testmods.module_finder_testmod import regular_mod
+        path, src, is_pkg = self.call('testmods.module_finder_testmod.regular_mod')
         self.assertEqual(path,
-            os.path.join(testlib.MODS_DIR, 'module_finder_testmod/regular_mod.py'))
+            os.path.join(testlib.TESTMODS_DIR, 'module_finder_testmod/regular_mod.py'))
         self.assertEqual(mitogen.core.to_text(src),
                           inspect.getsource(regular_mod))
         self.assertFalse(is_pkg)
@@ -122,8 +127,8 @@ class SysModulesMethodTest(testlib.TestCase):
         # linecache adds a line ending to the final line if one is missing.
         with open(path, 'rb') as f:
             actual_src = f.read()
-        if actual_src[-1:] != b('\n'):
-            actual_src += b('\n')
+        if actual_src[-1:] != mitogen.core.b('\n'):
+            actual_src += mitogen.core.b('\n')
 
         self.assertEqual(src, actual_src)
         self.assertFalse(is_pkg)
@@ -161,9 +166,9 @@ class ParentEnumerationMixin(object):
 
     def test_plumbum_colors_like_pkg_succeeds(self):
         # plumbum has been eating too many rainbow-colored pills
-        import pkg_like_plumbum.colors
-        path, src, is_pkg = self.call('pkg_like_plumbum.colors')
-        modpath = os.path.join(testlib.MODS_DIR, 'pkg_like_plumbum/colors.py')
+        import testmods.pkg_like_plumbum.colors
+        path, src, is_pkg = self.call('testmods.pkg_like_plumbum.colors')
+        modpath = os.path.join(testlib.TESTMODS_DIR, 'pkg_like_plumbum/colors.py')
         self.assertEqual(path, modpath)
 
         with open(modpath, 'rb') as f:
@@ -172,16 +177,16 @@ class ParentEnumerationMixin(object):
 
     def test_ansible_module_utils_distro_succeeds(self):
         # #590: a package that turns itself into a module.
-        import pkg_like_ansible.module_utils.distro as d
+        import testmods.pkg_like_ansible.module_utils.distro as d
         self.assertEqual(d.I_AM, "the module that replaced the package")
         self.assertEqual(
-            sys.modules['pkg_like_ansible.module_utils.distro'].__name__,
-            'pkg_like_ansible.module_utils.distro._distro'
+            sys.modules['testmods.pkg_like_ansible.module_utils.distro'].__name__,
+            'testmods.pkg_like_ansible.module_utils.distro._distro'
         )
 
         # ensure we can resolve the subpackage.
-        path, src, is_pkg = self.call('pkg_like_ansible.module_utils.distro')
-        modpath = os.path.join(testlib.MODS_DIR,
+        path, src, is_pkg = self.call('testmods.pkg_like_ansible.module_utils.distro')
+        modpath = os.path.join(testlib.TESTMODS_DIR,
             'pkg_like_ansible/module_utils/distro/__init__.py')
         self.assertEqual(path, modpath)
         with open(modpath, 'rb') as f:
@@ -190,9 +195,9 @@ class ParentEnumerationMixin(object):
 
         # ensure we can resolve a child of the subpackage.
         path, src, is_pkg = self.call(
-            'pkg_like_ansible.module_utils.distro._distro'
+            'testmods.pkg_like_ansible.module_utils.distro._distro'
         )
-        modpath = os.path.join(testlib.MODS_DIR,
+        modpath = os.path.join(testlib.TESTMODS_DIR,
             'pkg_like_ansible/module_utils/distro/_distro.py')
         self.assertEqual(path, modpath)
         with open(modpath, 'rb') as f:
@@ -202,16 +207,16 @@ class ParentEnumerationMixin(object):
     def test_ansible_module_utils_system_distro_succeeds(self):
         # #590: a package that turns itself into a module.
         # #590: a package that turns itself into a module.
-        import pkg_like_ansible.module_utils.sys_distro as d
+        import testmods.pkg_like_ansible.module_utils.sys_distro as d
         self.assertEqual(d.I_AM, "the system module that replaced the subpackage")
         self.assertEqual(
-            sys.modules['pkg_like_ansible.module_utils.sys_distro'].__name__,
-            'system_distro'
+            sys.modules['testmods.pkg_like_ansible.module_utils.sys_distro'].__name__,
+            'testmod_system_distro',
         )
 
         # ensure we can resolve the subpackage.
-        path, src, is_pkg = self.call('pkg_like_ansible.module_utils.sys_distro')
-        modpath = os.path.join(testlib.MODS_DIR,
+        path, src, is_pkg = self.call('testmods.pkg_like_ansible.module_utils.sys_distro')
+        modpath = os.path.join(testlib.TESTMODS_DIR,
             'pkg_like_ansible/module_utils/sys_distro/__init__.py')
         self.assertEqual(path, modpath)
         with open(modpath, 'rb') as f:
@@ -220,9 +225,9 @@ class ParentEnumerationMixin(object):
 
         # ensure we can resolve a child of the subpackage.
         path, src, is_pkg = self.call(
-            'pkg_like_ansible.module_utils.sys_distro._distro'
+            'testmods.pkg_like_ansible.module_utils.sys_distro._distro'
         )
-        modpath = os.path.join(testlib.MODS_DIR,
+        modpath = os.path.join(testlib.TESTMODS_DIR,
             'pkg_like_ansible/module_utils/sys_distro/_distro.py')
         self.assertEqual(path, modpath)
         with open(modpath, 'rb') as f:
@@ -303,67 +308,3 @@ class FindRelatedTest(testlib.TestCase):
         import mitogen.fakessh
         related = self.call('mitogen.fakessh')
         self.assertEqual(set(related), self.SIMPLE_EXPECT)
-
-
-class DjangoMixin(object):
-    WEBPROJECT_PATH = os.path.join(testlib.MODS_DIR, 'webproject')
-
-    @classmethod
-    def modules_expected_path(cls):
-        if sys.version_info[0:2] < (3, 0):
-            modules_expected_filename = 'modules_expected_py2x.json'
-        elif sys.version_info[0:2] <= (3, 6):
-            modules_expected_filename = 'modules_expected_py3x-legacy.json'
-        elif sys.version_info[0:2] >= (3, 10):
-            modules_expected_filename = 'modules_expected_py3x-new.json'
-        return os.path.join(cls.WEBPROJECT_PATH, modules_expected_filename)
-
-    @classmethod
-    def setUpClass(cls):
-        super(DjangoMixin, cls).setUpClass()
-        sys.path.append(cls.WEBPROJECT_PATH)
-        os.environ['DJANGO_SETTINGS_MODULE'] = 'webproject.settings'
-        with open(cls.modules_expected_path(), 'rb') as f:
-            cls.MODULES_EXPECTED = json.load(f)
-
-    @classmethod
-    def tearDownClass(cls):
-        sys.path.remove(cls.WEBPROJECT_PATH)
-        del os.environ['DJANGO_SETTINGS_MODULE']
-        super(DjangoMixin, cls).tearDownClass()
-
-
-class DjangoFindRelatedTest(DjangoMixin, testlib.TestCase):
-    maxDiff = None
-
-    def test_django_db(self):
-        import django.db
-        module_finder = mitogen.master.ModuleFinder()
-        related = module_finder.find_related('django.db')
-        expected = self.MODULES_EXPECTED['find_related']['django.db']
-        self.assertEqual(related, expected)
-
-    def test_django_db_models(self):
-        import django.db.models
-        module_finder = mitogen.master.ModuleFinder()
-        related = module_finder.find_related('django.db.models')
-        expected = self.MODULES_EXPECTED['find_related']['django.db.models']
-        self.assertEqual(related, expected)
-
-
-class DjangoFindRelatedImportsTest(DjangoMixin, testlib.TestCase):
-    maxDiff = None
-
-    def test_django_db(self):
-        import django.db
-        module_finder = mitogen.master.ModuleFinder()
-        related = module_finder.find_related_imports('django.db')
-        expected = self.MODULES_EXPECTED['find_related_imports']['django.db']
-        self.assertEqual(related, expected)
-
-    def test_django_db_models(self):
-        import django.db.models
-        module_finder = mitogen.master.ModuleFinder()
-        related = module_finder.find_related_imports('django.db.models')
-        expected = self.MODULES_EXPECTED['find_related_imports']['django.db.models']
-        self.assertEqual(related, expected)

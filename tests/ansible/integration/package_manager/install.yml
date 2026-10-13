@@ -1,0 +1,60 @@
+- name: integration/package_manager/install.yml, config
+  hosts: test-targets
+  become: "{{ groups.linux is defined and inventory_hostname in groups.linux }}"
+  # Delayed until after the end_play, due to Python version requirements
+  gather_facts: false
+  roles:
+    - role: package_manager
+  tags:
+    - issue_776
+
+- name: integration/package_manager/install.yml, setup
+  hosts: test-targets
+  become: "{{ groups.linux is defined and inventory_hostname in groups.linux }}"
+  strategy: linear  # Required for running raw module
+  # Delayed until after the end_play, due to Python version requirements
+  gather_facts: false
+  roles:
+    - package_manager_module
+  tags:
+    - issue_776
+
+- name: integration/package_manager/install.yml, tests
+  hosts: test-targets
+  become: "{{ groups.linux is defined and inventory_hostname in groups.linux }}"
+  gather_facts: true
+  vars:
+    ansible_python_interpreter: "{{ pkg_mgr_python_interpreter }}"
+    package: rsync  # Chosen to exist in all tested distros/package managers
+  tasks:
+    - name: Update package index
+      apt:
+        update_cache: true
+      when:
+        - ansible_facts.pkg_mgr in ["apt"]
+
+    - name: Test package module 1st call
+      package:
+        name: "{{ package }}"
+        state: present
+
+    - name: Test package module 2nd call
+      package:
+        name: "{{ package }}"
+        state: present
+
+    - name: Test dnf module 2nd call
+      dnf:
+        name: "{{ package }}"
+        state: present
+      when:
+        - ansible_facts.pkg_mgr == 'dnf'
+
+    - name: Test dnf module 2nd call
+      dnf:
+        name: "{{ package }}"
+        state: present
+      when:
+        - ansible_facts.pkg_mgr == 'dnf'
+  tags:
+    - issue_776

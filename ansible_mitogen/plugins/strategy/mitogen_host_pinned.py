@@ -29,7 +29,7 @@
 from __future__ import absolute_import, division, print_function
 __metaclass__ = type
 
-import os.path
+import os
 import sys
 
 #
@@ -47,12 +47,10 @@ import sys
 # debuggers and isinstance() work predictably.
 #
 
-BASE_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), '../../..')
-)
-
-if BASE_DIR not in sys.path:
-    sys.path.insert(0, BASE_DIR)
+try:
+    import ansible_mitogen
+except ImportError:
+    sys.path.insert(0, os.path.abspath(os.path.join(__file__, '../../../..')))
 
 import ansible_mitogen.loaders
 import ansible_mitogen.strategy

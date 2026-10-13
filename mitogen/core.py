@@ -62,19 +62,17 @@ else:
         del i, mpf
 
 
+import _codecs
 import binascii
 import collections
-import encodings.latin_1
-import encodings.utf_8
 import errno
 import fcntl
 import itertools
-import linecache
 import logging
 import os
-import pickle as py_pickle
 import pstats
 import pty
+import re
 import signal
 import socket
 import struct
@@ -87,13 +85,131 @@ import warnings
 import weakref
 import zlib
 
-try:
-    # Python >= 3.4, PEP 451 ModuleSpec API
+if sys.version_info >= (3, 6):
+    ModuleNotFoundError = ModuleNotFoundError
+else:
+    ModuleNotFoundError = ImportError
+
+if sys.version_info >= (3, 5):
+    from os import get_blocking, set_blocking
+else:
+    def get_blocking(fd):
+        return not fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_NONBLOCK
+
+    def set_blocking(fd, blocking):
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        if blocking:    fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
+        else:           fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+if sys.version_info >= (3, 4):
     import importlib.machinery
     import importlib.util
-except ImportError:
-    # Python < 3.4, PEP 302 Import Hooks
+else:
     import imp
+
+if sys.version_info >= (3, 3):
+    now = time.monotonic
+else:
+    now = time.time
+
+if sys.version_info >= (3, 0):
+    from pickle import PicklingError, Unpickler as _Unpickler, UnpicklingError
+    def find_deny(module, name):
+        raise UnpicklingError('Denied: %s.%s' % (module, name))
+    class Unpickler(_Unpickler):
+        def __init__(self, file, find_class=find_deny):
+            self.find_class = find_class
+            super().__init__(file, encoding='bytes')
+else:
+    from cPickle import PicklingError, Unpickler as _Unpickler, UnpicklingError
+    def find_deny(module, name):
+        raise UnpicklingError('Denied: %s.%s' % (module, name))
+    def Unpickler(file, find_class=find_deny):
+        unpickler = _Unpickler(file)
+        unpickler.find_global = find_class
+        return unpickler
+
+if sys.version_info >= (3, 0):
+    from pickle import Pickler as _Pickler
+    class Pickler(_Pickler):
+        def __init__(self, file, protocol):
+            self._file = file
+            self._protocol = protocol
+            super().__init__(file, protocol)
+        def dump(self, obj):
+            if self._protocol == 2 and type(obj) == bytes:
+                self._file.write(struct.pack('<BBBL', 128, 2, 84, len(obj)))
+                self._file.write(obj)
+                self._file.write(struct.pack('<B', 46))
+            else:
+                super().dump(obj)
+    str_partition, str_rpartition = str.partition, str.rpartition
+    bytes_partition = bytes.partition
+elif sys.version_info >= (2, 5):
+    from cPickle import Pickler
+    str_partition, str_rpartition = unicode.partition, unicode.rpartition
+    bytes_partition = str.partition
+else:
+    import pickle
+    class Pickler(pickle.Pickler):
+        def save_exc_inst(self, obj):
+            if isinstance(obj, CallError):
+                func, args = obj.__reduce__()
+                self.save(func)
+                self.save(args)
+                self.write(pickle.REDUCE)
+            else:
+                pickle.Pickler.save_inst(self, obj)
+
+        dispatch = pickle.Pickler.dispatch.copy()
+        dispatch[pickle.InstanceType] = save_exc_inst
+
+    def _part(s, sep, find):
+        "(str|unicode).(partition|rpartition) polyfill for Python 2.4"
+        idx = find(sep)
+        if idx != -1:
+            left = s[0:idx]
+            return left, sep, s[len(left)+len(sep):]
+    def str_partition(s, sep): return _part(s, sep, s.find) or (s, u'', u'')
+    def str_rpartition(s, sep): return _part(s, sep, s.rfind) or (u'', u'', s)
+    def bytes_partition(s, sep): return _part(s, sep, s.find) or (s, '', '')
+
+if sys.version_info >= (2, 6):
+    next = next
+    threading__current_thread = threading.current_thread
+    def threading__thread_name(thread): return thread.name
+else:
+    threading__current_thread = threading.currentThread
+    def next(it): return it.next()
+    def threading__thread_name(thread): return thread.getName()
+
+if sys.version_info >= (2, 5):
+    all, any = all, any
+    BaseException = BaseException
+    def _update_linecache(path, data): pass
+else:
+    import linecache
+    BaseException = Exception
+    def _update_linecache(path, data):
+        """
+        Directly populate the linecache cache for modules loaded by Mitogen.
+        In Python 2.4 the linecache module, does not support PEP-302.
+        """
+        if 'mitogen' not in path:
+            return
+        linecache.cache[path] = (len(data), 0.0, data.splitlines(True), path)
+
+    def all(it):
+        for elem in it:
+            if not elem:
+                return False
+        return True
+
+    def any(it):
+        for elem in it:
+            if elem:
+                return True
+        return False
 
 # Absolute imports for <2.5.
 select = __import__('select')
@@ -103,31 +219,14 @@ try:
 except ImportError:
     cProfile = None
 
-try:
-    BaseException
-except NameError:
-    BaseException = Exception
-
-try:
-    ModuleNotFoundError
-except NameError:
-    ModuleNotFoundError = ImportError
-
 # TODO: usage of 'import' after setting __name__, but before fixing up
 # sys.modules generates a warning. This happens when profiling = True.
 warnings.filterwarnings('ignore',
     "Parent module 'mitogen' not found while handling absolute import")
 
+LOGGERS = ('', 'mitogen', 'mitogen.io')
 LOG = logging.getLogger('mitogen')
 IOLOG = logging.getLogger('mitogen.io')
-IOLOG.setLevel(logging.INFO)
-
-# str.encode() may take import lock. Deadlock possible if broker calls
-# .encode() on behalf of thread currently waiting for module.
-LATIN1_CODEC = encodings.latin_1.Codec()
-
-_v = False
-_vv = False
 
 GET_MODULE = 100
 CALL_FUNCTION = 101
@@ -141,6 +240,8 @@ FORWARD_MODULE = 108
 DETACHING = 109
 CALL_SERVICE = 110
 STUB_CALL_SERVICE = 111
+GET_RESOURCE = 112
+LOAD_RESOURCE = 113
 
 #: Special value used to signal disconnection or the inability to route a
 #: message, when it appears in the `reply_to` field. Usually causes
@@ -157,8 +258,7 @@ IS_DEAD = 999
 
 PY24 = sys.version_info < (2, 5)
 PY3 = sys.version_info > (3,)
-if PY3:
-    import pickle
+if sys.version_info >= (3, 0):
     import _thread as thread
     from io import BytesIO
     b = str.encode
@@ -168,8 +268,8 @@ if PY3:
     BufferType = lambda buf, start: memoryview(buf)[start:]
     integer_types = (int,)
     iteritems, iterkeys, itervalues = dict.items, dict.keys, dict.values
+    range = range
 else:
-    import cPickle as pickle
     import thread
     from cStringIO import StringIO as BytesIO
     b = str
@@ -179,13 +279,9 @@ else:
     UnicodeType = unicode
     integer_types = (int, long)
     iteritems, iterkeys, itervalues = dict.iteritems, dict.iterkeys, dict.itervalues
+    range = xrange
 
 AnyTextType = (BytesType, UnicodeType)
-
-try:
-    next = next
-except NameError:
-    next = lambda it: it.next()
 
 # #550: prehistoric WSL did not advertise itself in uname output.
 try:
@@ -262,6 +358,18 @@ class LatchError(Error):
     pass
 
 
+class ModuleDeniedByOverridesError(ModuleNotFoundError):
+    fmt = "Mitogen won't serve %s, it's not in the overrides list"
+
+
+class ModuleDeniedByBlocksError(ModuleNotFoundError):
+    fmt = "Mitogen won't serve %s, it's in the blocks list"
+
+
+class ModuleUnsuitableError(ModuleNotFoundError):
+    fmt = "Mitogen won't serve %s, it's e.g. binary, legacy, part of stdlib"
+
+
 class Blob(BytesType):
     """
     A serializable bytes subclass whose content is summarized in repr() output,
@@ -282,7 +390,7 @@ class Secret(UnicodeType):
     def __repr__(self):
         return '[secret]'
 
-    if not PY3:
+    if sys.version_info < (3, 0):
         # TODO: what is this needed for in 2.x?
         def __str__(self):
             return UnicodeType(self)
@@ -301,7 +409,7 @@ class Kwargs(dict):
     whereas Python 3 produces keyword argument dicts whose keys are Unicode,
     requiring a helper for Python 2.4/2.5, where bytes are required.
     """
-    if PY3:
+    if sys.version_info >= (3, 0):
         def __init__(self, dct):
             for k, v in dct.items():
                 if type(k) is bytes:
@@ -312,7 +420,7 @@ class Kwargs(dict):
         def __init__(self, dct):
             for k, v in dct.iteritems():
                 if type(k) is unicode:
-                    k, _ = encodings.utf_8.encode(k)
+                    k, _ = _codecs.utf_8_encode(k)
                 self[k] = v
 
     def __repr__(self):
@@ -328,6 +436,8 @@ class CallError(Error):
     <mitogen.parent.Context.call>` fails. A copy of the traceback from the
     external context is appended to the exception message.
     """
+    MSG_MAX_LEN = 9999
+
     def __init__(self, fmt=None, *args):
         if not isinstance(fmt, BaseException):
             Error.__init__(self, fmt, *args)
@@ -346,8 +456,8 @@ class CallError(Error):
 
 
 def _unpickle_call_error(s):
-    if not (type(s) is UnicodeType and len(s) < 10000):
-        raise TypeError('cannot unpickle CallError: bad input')
+    _require_types(s, (UnicodeType,))
+    _require_length(s, 0, CallError.MSG_MAX_LEN)
     return CallError(s)
 
 
@@ -373,6 +483,32 @@ class TimeoutError(Error):
     pass
 
 
+def _require_bounds(v, min, max):
+    if not (min <= v <= max):
+        raise ValueError("Required bounds %d..%d, got %d" % (min, max, v))
+
+
+def _require_length(v, min, max):
+    if not min <= len(v) <= max:
+        raise ValueError("Required length %d..%d, got %d" % (min, max, len(v)))
+
+
+def _require_types(v, types):
+    if type(v) not in types:
+        raise TypeError("Required one of %r, got %s" % (types, type(v),))
+
+
+def _ensure_text(s, encoding='utf-8', errors='strict'):
+    """
+    Coerce a text or bytes string to UnicodeType, otherwise raise TypeError.
+
+    Unlike :func:`mitogen.core.to_text` don't stringify arbitrary objects.
+    """
+    if isinstance(s, UnicodeType): return UnicodeType(s)
+    if isinstance(s, BytesType): return s.decode(encoding, errors)
+    raise TypeError("Expected one of %r, got %s" % (AnyTextType, type(s)))
+
+
 def to_text(o):
     """
     Coerce `o` to Unicode by decoding it from UTF-8 if it is an instance of
@@ -382,64 +518,6 @@ def to_text(o):
     if isinstance(o, BytesType):
         return o.decode('utf-8')
     return UnicodeType(o)
-
-
-# Documented in api.rst to work around Sphinx limitation.
-now = getattr(time, 'monotonic', time.time)
-
-
-# Python 2.4
-try:
-    all, any = all, any
-except NameError:
-    def all(it):
-        for elem in it:
-            if not elem:
-                return False
-        return True
-
-    def any(it):
-        for elem in it:
-            if elem:
-                return True
-        return False
-
-
-def _partition(s, sep, find):
-    """
-    (str|unicode).(partition|rpartition) for Python 2.4/2.5.
-    """
-    idx = find(sep)
-    if idx != -1:
-        left = s[0:idx]
-        return left, sep, s[len(left)+len(sep):]
-
-
-def threading__current_thread():
-    try:
-        return threading.current_thread()  # Added in Python 2.6+
-    except AttributeError:
-        return threading.currentThread()  # Deprecated in Python 3.10+
-
-
-def threading__thread_name(thread):
-    try:
-        return thread.name  # Added in Python 2.6+
-    except AttributeError:
-        return thread.getName()  # Deprecated in Python 3.10+
-
-
-if hasattr(UnicodeType, 'rpartition'):
-    str_partition = UnicodeType.partition
-    str_rpartition = UnicodeType.rpartition
-    bytes_partition = BytesType.partition
-else:
-    def str_partition(s, sep):
-        return _partition(s, sep, s.find) or (s, u'', u'')
-    def str_rpartition(s, sep):
-        return _partition(s, sep, s.rfind) or (u'', u'', s)
-    def bytes_partition(s, sep):
-        return _partition(s, sep, s.find) or (s, '', '')
 
 
 def _has_parent_authority(context_id):
@@ -457,6 +535,11 @@ def has_parent_authority(msg, _stream=None):
     context.
     """
     return _has_parent_authority(msg.auth_id)
+
+
+def module_lineage(fullname):
+    "Return an iterator of a module's parent fullnames and its own"
+    return (fullname[:m.start()] for m in re.finditer(r'\.|\Z', fullname))
 
 
 def _signals(obj, signal):
@@ -524,20 +607,6 @@ def takes_router(func):
     return func
 
 
-def is_blacklisted_import(importer, fullname):
-    """
-    Return :data:`True` if `fullname` is part of a blacklisted package, or if
-    any packages have been whitelisted and `fullname` is not part of one.
-
-    NB:
-      - If a package is on both lists, then it is treated as blacklisted.
-      - If any package is whitelisted, then all non-whitelisted packages are
-        treated as blacklisted.
-    """
-    return ((not any(fullname.startswith(s) for s in importer.whitelist)) or
-                (any(fullname.startswith(s) for s in importer.blacklist)))
-
-
 def set_cloexec(fd):
     """
     Set the file descriptor `fd` to automatically close on :func:`os.execve`.
@@ -557,26 +626,6 @@ def set_cloexec(fd):
     assert fd not in stdfds, 'fd %r is one of the stdio fds: %r' % (fd, stdfds)
     flags = fcntl.fcntl(fd, fcntl.F_GETFD)
     fcntl.fcntl(fd, fcntl.F_SETFD, flags | fcntl.FD_CLOEXEC)
-
-
-def set_nonblock(fd):
-    """
-    Set the file descriptor `fd` to non-blocking mode. For most underlying file
-    types, this causes :func:`os.read` or :func:`os.write` to raise
-    :class:`OSError` with :data:`errno.EAGAIN` rather than block the thread
-    when the underlying kernel buffer is exhausted.
-    """
-    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-
-
-def set_block(fd):
-    """
-    Inverse of :func:`set_nonblock`, i.e. cause `fd` to block the thread when
-    the underlying kernel buffer is exhausted.
-    """
-    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-    fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
 
 
 def io_op(func, *args):
@@ -605,7 +654,7 @@ def io_op(func, *args):
             return func(*args), None
         except (select.error, OSError, IOError):
             e = sys.exc_info()[1]
-            _vv and IOLOG.debug('io_op(%r) -> OSError: %s', func, e)
+            IOLOG.debug('io_op(%r) -> OSError: %s', func, e)
             if e.args[0] == errno.EINTR:
                 continue
             if e.args[0] in (errno.EIO, errno.ECONNRESET, errno.EPIPE):
@@ -654,12 +703,8 @@ class PidfulStreamHandler(logging.StreamHandler):
 
 
 def enable_debug_logging():
-    global _v, _vv
-    _v = True
-    _vv = True
+    for name in LOGGERS: logging.getLogger(name).setLevel(logging.DEBUG)
     root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
-    IOLOG.setLevel(logging.DEBUG)
     handler = PidfulStreamHandler()
     handler.formatter = logging.Formatter(
         '%(asctime)s %(levelname).1s %(name)s: %(message)s',
@@ -720,7 +765,7 @@ def import_module(modname):
     return __import__(modname, None, None, [''])
 
 
-def pipe():
+def pipe(blocking=None):
     """
     Create a UNIX pipe pair using :func:`os.pipe`, wrapping the returned
     descriptors in Python file objects in order to manage their lifetime and
@@ -728,10 +773,20 @@ def pipe():
     not been closed explicitly.
     """
     rfd, wfd = os.pipe()
+    for fd in rfd, wfd:
+        if blocking is not None: set_blocking(fd, blocking)  # noqa: E701
     return (
         os.fdopen(rfd, 'rb', 0),
         os.fdopen(wfd, 'wb', 0)
     )
+
+
+def socketpair(blocking=None):
+    fp1, fp2 = socket.socketpair()
+    for fp in fp1, fp2:
+        fd = fp.fileno()
+        if blocking is not None: set_blocking(fd, blocking)  # noqa: E701
+    return fp1, fp2
 
 
 def iter_split(buf, delim, func):
@@ -757,54 +812,6 @@ def iter_split(buf, delim, func):
     return buf[start:], cont
 
 
-class Py24Pickler(py_pickle.Pickler):
-    """
-    Exceptions were classic classes until Python 2.5. Sadly for 2.4, cPickle
-    offers little control over how a classic instance is pickled. Therefore 2.4
-    uses a pure-Python pickler, so CallError can be made to look as it does on
-    newer Pythons.
-
-    This mess will go away once proper serialization exists.
-    """
-    @classmethod
-    def dumps(cls, obj, protocol):
-        bio = BytesIO()
-        self = cls(bio, protocol=protocol)
-        self.dump(obj)
-        return bio.getvalue()
-
-    def save_exc_inst(self, obj):
-        if isinstance(obj, CallError):
-            func, args = obj.__reduce__()
-            self.save(func)
-            self.save(args)
-            self.write(py_pickle.REDUCE)
-        else:
-            py_pickle.Pickler.save_inst(self, obj)
-
-    if PY24:
-        dispatch = py_pickle.Pickler.dispatch.copy()
-        dispatch[py_pickle.InstanceType] = save_exc_inst
-
-
-if PY3:
-    # In 3.x Unpickler is a class exposing find_class as an overridable, but it
-    # cannot be overridden without subclassing.
-    class _Unpickler(pickle.Unpickler):
-        def find_class(self, module, func):
-            return self.find_global(module, func)
-    pickle__dumps = pickle.dumps
-elif PY24:
-    # On Python 2.4, we must use a pure-Python pickler.
-    pickle__dumps = Py24Pickler.dumps
-    _Unpickler = pickle.Unpickler
-else:
-    pickle__dumps = pickle.dumps
-    # In 2.x Unpickler is a function exposing a writeable find_global
-    # attribute.
-    _Unpickler = pickle.Unpickler
-
-
 class Message(object):
     """
     Messages are the fundamental unit of communication, comprising fields from
@@ -812,6 +819,9 @@ class Message(object):
     :class:`mitogen.core.Router` for ingress messages, and helper methods for
     deserialization and generating replies.
     """
+    ENCS = frozenset(range(0x4d49, 0x4d49+3))
+    ENC_MGC, ENC_PKL, ENC_BIN = sorted(ENCS)
+
     #: Integer target context ID. :class:`Router` delivers messages locally
     #: when their :attr:`dst_id` matches :data:`mitogen.context_id`, otherwise
     #: they are routed up or downstream.
@@ -838,7 +848,10 @@ class Message(object):
     #: Raw message data bytes.
     data = b('')
 
-    _unpickled = object()
+    #: Encoding of payload in :attr:`data`, one of the ``ENC_*`` constants.
+    #: :attr:`ENC_MGC` is an implicit, legacy value. New features &
+    #: :ref:`standard-handles` should explicitly declare an encoding.
+    enc = ENC_MGC
 
     #: The :class:`Router` responsible for routing the message. This is
     #: :data:`None` for locally originated messages.
@@ -850,7 +863,7 @@ class Message(object):
 
     HEADER_FMT = '>hLLLLLL'
     HEADER_LEN = struct.calcsize(HEADER_FMT)
-    HEADER_MAGIC = 0x4d49  # 'MI'
+    HEADER_MAGIC = ENC_MGC
 
     def __init__(self, **kwargs):
         """
@@ -861,10 +874,12 @@ class Message(object):
         self.auth_id = mitogen.context_id
         vars(self).update(kwargs)
         assert isinstance(self.data, BytesType), 'Message data is not Bytes'
+        if self.enc not in self.ENCS:
+            raise ValueError('Invalid enc: %r' % (self.enc,))
 
     def pack(self):
         return (
-            struct.pack(self.HEADER_FMT, self.HEADER_MAGIC, self.dst_id,
+            struct.pack(self.HEADER_FMT, self.enc, self.dst_id,
                         self.src_id, self.auth_id, self.handle,
                         self.reply_to or 0, len(self.data))
             + self.data
@@ -877,7 +892,7 @@ class Message(object):
         return _unpickle_sender(self.router, context_id, dst_handle)
 
     def _unpickle_bytes(self, s, encoding):
-        s, n = LATIN1_CODEC.encode(s)
+        s, n = _codecs.latin_1_encode(s)
         return s
 
     def _find_global(self, module, func):
@@ -919,30 +934,38 @@ class Message(object):
         """
         Syntax helper to construct a dead message.
         """
-        kwargs['data'], _ = encodings.utf_8.encode(reason or u'')
+        kwargs['data'], _ = _codecs.utf_8_encode(reason or u'')
         return cls(reply_to=IS_DEAD, **kwargs)
 
     @classmethod
-    def pickled(cls, obj, **kwargs):
+    def encoded(cls, obj, enc, **kwargs):
+        if enc == cls.ENC_PKL: return cls.pickled(obj, **kwargs)
+        if enc == cls.ENC_BIN: return cls(data=obj, enc=enc, **kwargs)
+        raise ValueError('Invalid explicit enc: %r' % (enc,))
+
+    @classmethod
+    def pickled(cls, *args, **kwargs):
         """
         Construct a pickled message, setting :attr:`data` to the serialization
-        of `obj`, and setting remaining fields using `kwargs`.
+        of each object in `args`, and setting remaining fields using `kwargs`.
 
         :returns:
             The new message.
         """
-        self = cls(**kwargs)
-        try:
-            self.data = pickle__dumps(obj, protocol=2)
-        except pickle.PicklingError:
-            e = sys.exc_info()[1]
-            self.data = pickle__dumps(CallError(e), protocol=2)
-        return self
+        f = BytesIO()
+        p = Pickler(f, protocol=2)
+        for obj in args:
+            try:
+                p.dump(obj)
+            except PicklingError:
+                exc = sys.exc_info()[1]
+                p.dump(CallError(exc))
+        return cls(enc=cls.ENC_PKL, data=f.getvalue(), **kwargs)
 
     def reply(self, msg, router=None, **kwargs):
         """
         Compose a reply to this message and send it using :attr:`router`, or
-        `router` is :attr:`router` is :data:`None`.
+        `router` if :attr:`router` is :data:`None`.
 
         :param obj:
             Either a :class:`Message`, or an object to be serialized in order
@@ -963,11 +986,6 @@ class Message(object):
             LOG.debug('dropping reply to message with no return address: %r',
                       msg)
 
-    if PY3:
-        UNPICKLER_KWARGS = {'encoding': 'bytes'}
-    else:
-        UNPICKLER_KWARGS = {}
-
     def _throw_dead(self):
         if len(self.data):
             raise ChannelError(self.data.decode('utf-8', 'replace'))
@@ -976,28 +994,52 @@ class Message(object):
         else:
             raise ChannelError(ChannelError.remote_msg)
 
-    def unpickle(self, throw=True, throw_dead=True):
+    def decode(self, throw=True, throw_dead=True):
+        if self.enc == self.ENC_PKL: return self.unpickle(throw, throw_dead)
+        if self.enc == self.ENC_BIN: return self.data
+        raise ValueError('Invalid explicit enc: %r' % (self.enc,))
+
+    def unpickle(self, throw=True, throw_dead=True, find_class=None):
         """
-        Unpickle :attr:`data`, optionally raising any exceptions present.
+        Return the first unpickled stream in :attr:`data`, optionally raise
+        :exc:`CallError` if the unpickled object is such.
+
+        `throw` and `throw_dead` behave the same as with :meth:`unpickle_iter`.
+
+        :param find_class:
+            Callable that takes ``(module, func)`` and returns a constructor.
+            Defaults to :meth:`_find_global`.
+        """
+        if find_class is None: find_class = self._find_global
+        return next(self.unpickle_iter(throw, throw_dead, find_class))
+
+    def unpickle_iter(self, throw=True, throw_dead=True, find_class=find_deny):
+        """
+        Return an iterator of objects unpickled from :attr:`data`, optionally
+        raising any :exc:`CallError` exceptions present.
 
         :param bool throw_dead:
             If :data:`True`, raise exceptions, otherwise it is the caller's
             responsibility.
+        :param find_class:
+            Callable that takes ``(module, func)`` and returns a constructor.
+            Default: :func:`find_deny`.
 
         :raises CallError:
             The serialized data contained CallError exception.
         :raises ChannelError:
             The `is_dead` field was set.
         """
-        _vv and IOLOG.debug('%r.unpickle()', self)
+        if self.enc not in (self.ENC_MGC, self.ENC_PKL):
+            raise ValueError(
+                'Message %r is not pickled, invalid enc=%r', self, self.enc,
+            )
         if throw_dead and self.is_dead:
             self._throw_dead()
 
-        obj = self._unpickled
-        if obj is Message._unpickled:
-            fp = BytesIO(self.data)
-            unpickler = _Unpickler(fp, **self.UNPICKLER_KWARGS)
-            unpickler.find_global = self._find_global
+        file = BytesIO(self.data)
+        unpickler = Unpickler(file, find_class)
+        while file.tell() < len(self.data):
             try:
                 # Must occur off the broker thread.
                 try:
@@ -1005,21 +1047,24 @@ class Message(object):
                 except:
                     LOG.error('raw pickle was: %r', self.data)
                     raise
-                self._unpickled = obj
             except (TypeError, ValueError):
                 e = sys.exc_info()[1]
                 raise StreamError('invalid message: %s', e)
 
-        if throw:
-            if isinstance(obj, CallError):
+            if throw and isinstance(obj, CallError):
                 raise obj
 
-        return obj
+            yield obj
 
     def __repr__(self):
-        return 'Message(%r, %r, %r, %r, %r, %r..%d)' % (
-            self.dst_id, self.src_id, self.auth_id, self.handle,
-            self.reply_to, (self.data or '')[:50], len(self.data)
+        if len(self.data) > 60:
+            head, tail, size = self.data[:25], self.data[-25:], len(self.data)
+            data_summary = b('%s .. %s %d bytes') % (head, tail, size)
+        else:
+            data_summary = self.data
+        return 'Message(src=%r:%r dst=%r:%r auth_id=%r %r)' % (
+            self.src_id, self.reply_to, self.dst_id, self.handle, self.auth_id,
+            data_summary,
         )
 
 
@@ -1040,12 +1085,12 @@ class Sender(object):
         self.context = context
         self.dst_handle = dst_handle
 
-    def send(self, data):
+    def send(self, data, enc=Message.ENC_PKL):
         """
         Send `data` to the remote end.
         """
-        _vv and IOLOG.debug('%r.send(%r..)', self, repr(data)[:100])
-        self.context.send(Message.pickled(data, handle=self.dst_handle))
+        IOLOG.debug('%r.send(%*r.., enc=%s)', self, 100, data, enc)
+        self.context.send(Message.encoded(data, enc, handle=self.dst_handle))
 
     explicit_close_msg = 'Sender was explicitly closed'
 
@@ -1054,7 +1099,7 @@ class Sender(object):
         Send a dead message to the remote, causing :meth:`ChannelError` to be
         raised in any waiting thread.
         """
-        _vv and IOLOG.debug('%r.close()', self)
+        IOLOG.debug('%r.close()', self)
         self.context.send(
             Message.dead(
                 reason=self.explicit_close_msg,
@@ -1070,10 +1115,12 @@ class Sender(object):
 
 
 def _unpickle_sender(router, context_id, dst_handle):
-    if not (isinstance(router, Router) and
-            isinstance(context_id, integer_types) and context_id >= 0 and
-            isinstance(dst_handle, integer_types) and dst_handle > 0):
-        raise TypeError('cannot unpickle Sender: bad input or missing router')
+    _require_types(context_id, integer_types)
+    _require_bounds(context_id, Context.ID_MIN, Context.ID_MAX)
+    _require_types(dst_handle, integer_types)
+    _require_bounds(dst_handle, 1, 2**32-1)
+    if not isinstance(router, Router):
+        raise TypeError('Cannot unpickle Sender: missing router')
     return Sender(Context(router, context_id), dst_handle)
 
 
@@ -1159,7 +1206,7 @@ class Receiver(object):
         Callback registered for the handle with :class:`Router`; appends data
         to the internal queue.
         """
-        _vv and IOLOG.debug('%r._on_receive(%r)', self, msg)
+        IOLOG.debug('%r._on_receive(%r)', self, msg)
         self._latch.put(msg)
         if self.notify:
             self.notify(self)
@@ -1224,7 +1271,7 @@ class Receiver(object):
         :returns:
             :class:`Message` that was received.
         """
-        _vv and IOLOG.debug('%r.get(timeout=%r, block=%r)', self, timeout, block)
+        IOLOG.debug('%r.get(timeout=%r, block=%r)', self, timeout, block)
         try:
             msg = self._latch.get(timeout=timeout, block=block)
         except LatchError:
@@ -1281,6 +1328,46 @@ class Channel(Sender, Receiver):
         )
 
 
+class ImportPolicy(object):
+    """
+    Policy deciding which module prefixes :class:`Importer` will request from
+    :class:`mitogen.master.ModuleResponder` and which requests will be served
+    or denied.
+
+    :param overrides:
+        Prefixes always requested, ignoring local versions. If ``overrides``
+        has entries, then it's also used as an allow list by the responder -
+        any request for a prefix that's not overriden will be denied.
+
+    :param blocks:
+        Prefixes always denied by the responder, only local versions can be
+        used.
+    """
+    def __init__(self, overrides=(), blocks=()):
+        self.overrides = set(overrides)
+        self.blocks = set(blocks)
+        self._always = set(Importer.ALWAYS_BLACKLIST)
+
+    def denied(self, fullname):
+        fullnames = frozenset(module_lineage(fullname))
+        if self.overrides and not self.overrides.intersection(fullnames):
+            return ModuleDeniedByOverridesError
+        if self.blocks.intersection(fullnames): return ModuleDeniedByBlocksError
+        if self._always.intersection(fullnames): return ModuleUnsuitableError
+        return False
+
+    def denied_raise(self, fullname):
+        denial = self.denied(fullname)
+        if denial: raise denial(denial.fmt % (fullname,))
+
+    def overriden(self, fullname):
+        return bool(self.overrides.intersection(module_lineage(fullname)))
+
+    def __repr__(self):
+        args = (type(self).__name__, self.overrides, self.blocks)
+        return '%s(overrides=%r, blocks=%r)' % args
+
+
 class Importer(object):
     """
     Import protocol implementation that fetches modules from the parent
@@ -1299,6 +1386,7 @@ class Importer(object):
         'kubectl',
         'fakessh',
         'fork',
+        'imports',
         'jail',
         'lxc',
         'lxd',
@@ -1336,27 +1424,21 @@ class Importer(object):
         'org',
     ]
 
-    if PY3:
+    if sys.version_info >= (3, 0):
         ALWAYS_BLACKLIST += ['cStringIO']
 
-    def __init__(self, router, context, core_src, whitelist=(), blacklist=()):
+    def __init__(self, router, context, core_src, policy):
         self._log = logging.getLogger('mitogen.importer')
         self._context = context
         self._present = {'mitogen': self.MITOGEN_PKG_CONTENT}
         self._lock = threading.Lock()
-        self.whitelist = list(whitelist) or ['']
-        self.blacklist = list(blacklist) + self.ALWAYS_BLACKLIST
-
-        # Preserve copies of the original server-supplied whitelist/blacklist
-        # for later use by children.
-        self.master_whitelist = self.whitelist[:]
-        self.master_blacklist = self.blacklist[:]
+        self.policy = policy
 
         # Presence of an entry in this map indicates in-flight GET_MODULE.
         self._callbacks = {}
         self._cache = {}
         if core_src:
-            self._update_linecache('x/mitogen/core.py', core_src)
+            _update_linecache('x/mitogen/core.py', core_src)
             self._cache['mitogen.core'] = (
                 'mitogen.core',
                 None,
@@ -1365,21 +1447,6 @@ class Importer(object):
                 [],
             )
         self._install_handler(router)
-
-    def _update_linecache(self, path, data):
-        """
-        The Python 2.4 linecache module, used to fetch source code for
-        tracebacks and :func:`inspect.getsource`, does not support PEP-302,
-        meaning it needs extra help to for Mitogen-loaded modules. Directly
-        populate its cache if a loaded module belongs to the Mitogen package.
-        """
-        if PY24 and 'mitogen' in path:
-            linecache.cache[path] = (
-                len(data),
-                0.0,
-                [line+'\n' for line in data.splitlines()],
-                path,
-            )
 
     def _install_handler(self, router):
         router.add_handler(
@@ -1445,7 +1512,6 @@ class Importer(object):
 
         _tls.running = True
         try:
-            #_v and self._log.debug('Python requested %r', fullname)
             fullname = to_text(fullname)
             pkgname, _, suffix = str_rpartition(fullname, '.')
             pkg = sys.modules.get(pkgname)
@@ -1458,17 +1524,14 @@ class Importer(object):
                 self._log.debug('%s has no submodule %s', pkgname, suffix)
                 return None
 
-            # #114: explicitly whitelisted prefixes override any
-            # system-installed package.
-            if self.whitelist != ['']:
-                if any(fullname.startswith(s) for s in self.whitelist):
-                    return self
+            if self.policy.overriden(fullname):
+                return self
 
             try:
                 self.builtin_find_module(fullname)
-                _vv and self._log.debug('%r is available locally', fullname)
+                self._log.debug('%r is available locally', fullname)
             except ImportError:
-                _vv and self._log.debug('we will try to load %r', fullname)
+                self._log.debug('we will try to load %r', fullname)
                 return self
         finally:
             del _tls.running
@@ -1508,11 +1571,9 @@ class Importer(object):
                       fullname, pkgname, pkg_loader)
             return None
 
-        # #114: whitelisted prefixes override any system-installed package.
-        if self.whitelist != ['']:
-            if any(s and fullname.startswith(s) for s in self.whitelist):
-                log.debug('Handling %s. It is whitelisted', fullname)
-                return importlib.machinery.ModuleSpec(fullname, loader=self)
+        if self.policy.overriden(fullname):
+            log.debug('Handling %s. It is overriden', fullname)
+            return importlib.machinery.ModuleSpec(fullname, loader=self)
 
         if fullname == '__main__':
             log.debug('Handling %s. A special case', fullname)
@@ -1533,11 +1594,6 @@ class Importer(object):
         log.debug('Handling %s. Unavailable locally', fullname)
         return importlib.machinery.ModuleSpec(fullname, loader=self)
 
-    blacklisted_msg = (
-        '%r is present in the Mitogen importer blacklist, therefore this '
-        'context will not attempt to request it from the master, as the '
-        'request will always be refused.'
-    )
     pkg_resources_msg = (
         'pkg_resources is prohibited from importing __main__, as it causes '
         'problems in applications whose main module is not designed to be '
@@ -1550,8 +1606,7 @@ class Importer(object):
     )
 
     def _refuse_imports(self, fullname):
-        if is_blacklisted_import(self, fullname):
-            raise ModuleNotFoundError(self.blacklisted_msg % (fullname,))
+        self.policy.denied_raise(fullname)
 
         f = sys._getframe(2)
         requestee = f.f_globals['__name__']
@@ -1579,13 +1634,13 @@ class Importer(object):
 
         tup = msg.unpickle()
         fullname = tup[0]
-        _v and self._log.debug('received %s', fullname)
+        self._log.debug('received %s', fullname)
 
         self._lock.acquire()
         try:
             self._cache[fullname] = tup
-            if tup[2] is not None and PY24:
-                self._update_linecache(
+            if sys.version_info < (2, 5) and tup[2] is not None:
+                _update_linecache(
                     path='master:' + tup[2],
                     data=zlib.decompress(tup[3])
                 )
@@ -1603,11 +1658,11 @@ class Importer(object):
             if not present:
                 funcs = self._callbacks.get(fullname)
                 if funcs is not None:
-                    _v and self._log.debug('existing request for %s in flight',
+                    self._log.debug('existing request for %s in flight',
                                            fullname)
                     funcs.append(callback)
                 else:
-                    _v and self._log.debug('sending new %s request to parent',
+                    self._log.debug('sending new %s request to parent',
                                            fullname)
                     self._callbacks[fullname] = [callback]
                     self._context.send(
@@ -1685,7 +1740,7 @@ class Importer(object):
         Deprecated in Python 3.4+, replaced by create_module() & exec_module().
         """
         fullname = to_text(fullname)
-        _v and self._log.debug('requesting %s', fullname)
+        self._log.debug('requesting %s', fullname)
         self._refuse_imports(fullname)
 
         event = threading.Event()
@@ -1707,9 +1762,9 @@ class Importer(object):
         else:
             mod.__package__ = str_rpartition(fullname, '.')[0] or None
 
-        if mod.__package__ and not PY3:
+        if sys.version_info < (3, 0) and mod.__package__:
             # 2.x requires __package__ to be exactly a string.
-            mod.__package__, _ = encodings.utf_8.encode(mod.__package__)
+            mod.__package__, _ = _codecs.utf_8_encode(mod.__package__)
 
         source = self.get_source(fullname)
         try:
@@ -1718,7 +1773,7 @@ class Importer(object):
             LOG.exception('while importing %r', fullname)
             raise
 
-        if PY3:
+        if sys.version_info >= (3, 0):
             exec(code, vars(mod))
         else:
             exec('exec code in vars(mod)')
@@ -1745,9 +1800,102 @@ class Importer(object):
                 raise ModuleNotFoundError(self.absent_msg % (fullname,))
 
             source = zlib.decompress(self._cache[fullname][3])
-            if PY3:
+            if sys.version_info >= (3, 0):
                 return to_text(source)
             return source
+
+    def get_resource_reader(self, fullname):
+        """
+        Optional :class:`importlib.abc.Loader` method to provide data (files)
+        bundled with a package.
+
+        Introduced in Python 3.7.
+        """
+        return ResourceReader(self._resource_requester, fullname)
+
+
+class ResourceRequester(object):
+    """
+    Requests Python package resources from upstreams & caches responses.
+    """
+    def __init__(self, router, context):
+        self._context = context
+        self._lock = threading.Lock()
+        self._callbacks = {}
+        self._cache = {}
+        router.add_handler(
+            fn=self._on_load_resource,
+            handle=LOAD_RESOURCE,
+            policy=has_parent_authority,
+        )
+
+    def _get_resource(self, fullname, resource):
+        event = threading.Event()
+        self._request_resource(fullname, resource, event.set)
+        event.wait()
+        content = self._cache[(fullname, resource)]
+        return content
+
+    def _request_resource(self, fullname, resource, callback):
+        self._lock.acquire()
+        try:
+            present = (fullname, resource) in self._cache
+            if not present:
+                callbacks = self._callbacks.get((fullname, resource))
+                if callbacks is not None:
+                    callbacks.append(callback)
+                else:
+                    self._callbacks[(fullname, resource)] = [callback]
+                    msg = Message.pickled(
+                        (fullname, resource),
+                        handle=GET_RESOURCE,
+                    )
+                    self._context.send(msg)
+        finally:
+            self._lock.release()
+
+        if present:
+            callback()
+
+    def _on_load_resource(self, msg):
+        if msg.is_dead:
+            return
+        (fullname, resource), content = msg.unpickle_iter()
+
+        self._lock.acquire()
+        try:
+            self._cache[(fullname, resource)] = content
+            callbacks = self._callbacks.pop((fullname, resource), [])
+        finally:
+            self._lock.release()
+
+        for callback in callbacks:
+            callback()
+
+
+class ResourceReader(object):
+    """
+    Implements :class:`importlib.resource.abc.ResourceReader` (Python >= 3.7).
+    """
+    def __init__(self, requester, fullname):
+        self._requester = requester
+        self._fullname = fullname
+
+    def open_resource(self, resource):
+        content = self._requester._get_resource(self._fullname, resource)
+        if content is None:
+            raise FileNotFoundError
+        return BytesIO(content)
+
+    def resource_path(self, resource):
+        raise FileNotFoundError
+
+    def is_resource(self, name):
+        content = self._requester._get_resource(self._fullname, name)
+        return bool(content is not None)
+
+    def contents(self):
+        raise NotImplementedError
 
 
 class LogHandler(logging.Handler):
@@ -1802,18 +1950,18 @@ class LogHandler(logging.Handler):
         finally:
             self._buffer_lock.release()
 
-    def emit(self, rec):
+    def emit(self, record):
         """
         Send a :data:`FORWARD_LOG` message towards the target context.
         """
-        if rec.name == 'mitogen.io' or \
+        if record.name == 'mitogen.io' or \
            getattr(self.local, 'in_emit', False):
             return
 
         self.local.in_emit = True
         try:
-            msg = self.format(rec)
-            encoded = '%s\x00%s\x00%s' % (rec.name, rec.levelno, msg)
+            msg = self.format(record)
+            encoded = '%s\x00%s\x00%s' % (record.name, record.levelno, msg)
             if isinstance(encoded, UnicodeType):
                 # Logging package emits both :(
                 encoded = encoded.encode('utf-8')
@@ -1879,8 +2027,7 @@ class Stream(object):
         """
         Attach a pair of file objects to :attr:`receive_side` and
         :attr:`transmit_side`, after wrapping them in :class:`Side` instances.
-        :class:`Side` will call :func:`set_nonblock` and :func:`set_cloexec`
-        on the underlying file descriptors during construction.
+        :class:`Side` will call :func:`set_cloexec` on them.
 
         The same file object may be used for both sides. The default
         :meth:`on_disconnect` is handles the possibility that only one
@@ -1994,7 +2141,7 @@ class Protocol(object):
         )
 
     def on_shutdown(self, broker):
-        _v and LOG.debug('%r: shutting down', self)
+        LOG.debug('%r: shutting down', self)
         self.stream.on_disconnect(broker)
 
     def on_disconnect(self, broker):
@@ -2036,7 +2183,7 @@ class DelimitedProtocol(Protocol):
     _trailer = b('')
 
     def on_receive(self, broker, buf):
-        _vv and IOLOG.debug('%r.on_receive()', self)
+        IOLOG.debug('%r.on_receive()', self)
         stream = self.stream
         self._trailer, cont = mitogen.core.iter_split(
             buf=self._trailer + buf,
@@ -2120,13 +2267,13 @@ class BufferedWriter(object):
             buf = self._buf.popleft()
             written = self._protocol.stream.transmit_side.write(buf)
             if not written:
-                _v and LOG.debug('disconnected during write to %r', self)
+                LOG.debug('disconnected during write to %r', self)
                 self._protocol.stream.on_disconnect(broker)
                 return
             elif written != len(buf):
                 self._buf.appendleft(BufferType(buf, written))
 
-            _vv and IOLOG.debug('transmitted %d bytes to %r', written, self)
+            IOLOG.debug('transmitted %d bytes to %r', written, self)
             self._len -= written
 
         if not self._buf:
@@ -2155,14 +2302,11 @@ class Side(object):
     :param bool keep_alive:
         If :data:`True`, the continued existence of this side will extend the
         shutdown grace period until it has been unregistered from the broker.
-    :param bool blocking:
-        If :data:`False`, the descriptor has its :data:`os.O_NONBLOCK` flag
-        enabled using :func:`fcntl.fcntl`.
     """
     _fork_refs = weakref.WeakValueDictionary()
     closed = False
 
-    def __init__(self, stream, fp, cloexec=True, keep_alive=True, blocking=False):
+    def __init__(self, stream, fp, cloexec=True, keep_alive=True):
         #: The :class:`Stream` for which this is a read or write side.
         self.stream = stream
         # File or socket object responsible for the lifetime of its underlying
@@ -2180,8 +2324,6 @@ class Side(object):
         self._fork_refs[id(self)] = self
         if cloexec:
             set_cloexec(self.fd)
-        if not blocking:
-            set_nonblock(self.fd)
 
     def __repr__(self):
         return '<Side of %s fd %s>' % (
@@ -2193,7 +2335,7 @@ class Side(object):
     def _on_fork(cls):
         while cls._fork_refs:
             _, side = cls._fork_refs.popitem()
-            _vv and IOLOG.debug('Side._on_fork() closing %r', side)
+            IOLOG.debug('Side._on_fork() closing %r', side)
             side.close()
 
     def close(self):
@@ -2201,7 +2343,7 @@ class Side(object):
         Call :meth:`file.close` on :attr:`fp` if it is not :data:`None`,
         then set it to :data:`None`.
         """
-        _vv and IOLOG.debug('%r.close()', self)
+        IOLOG.debug('%r.close()', self)
         if not self.closed:
             self.closed = True
             self.fp.close()
@@ -2296,7 +2438,7 @@ class MitogenProtocol(Protocol):
         Handle the next complete message on the stream. Raise
         :class:`StreamError` on failure.
         """
-        _vv and IOLOG.debug('%r.on_receive()', self)
+        IOLOG.debug('%r.on_receive()', self)
         if self._input_buf and self._input_buf_len < 128:
             self._input_buf[0] += buf
         else:
@@ -2319,13 +2461,13 @@ class MitogenProtocol(Protocol):
 
         msg = Message()
         msg.router = self._router
-        (magic, msg.dst_id, msg.src_id, msg.auth_id,
+        (msg.enc, msg.dst_id, msg.src_id, msg.auth_id,
          msg.handle, msg.reply_to, msg_len) = struct.unpack(
             Message.HEADER_FMT,
             self._input_buf[0][:Message.HEADER_LEN],
         )
 
-        if magic != Message.HEADER_MAGIC:
+        if msg.enc not in Message.ENCS:
             LOG.error(self.corrupt_msg, self.stream.name, self._input_buf[0][:2048])
             self.stream.on_disconnect(broker)
             return False
@@ -2338,7 +2480,7 @@ class MitogenProtocol(Protocol):
 
         total_len = msg_len + Message.HEADER_LEN
         if self._input_buf_len < total_len:
-            _vv and IOLOG.debug(
+            IOLOG.debug(
                 '%r: Input too short (want %d, got %d)',
                 self, msg_len, self._input_buf_len - Message.HEADER_LEN
             )
@@ -2377,11 +2519,11 @@ class MitogenProtocol(Protocol):
         """
         Transmit buffered messages.
         """
-        _vv and IOLOG.debug('%r.on_transmit()', self)
+        IOLOG.debug('%r.on_transmit()', self)
         self._writer.on_transmit(broker)
 
     def _send(self, msg):
-        _vv and IOLOG.debug('%r._send(%r)', self, msg)
+        IOLOG.debug('%r._send(%r)', self, msg)
         self._writer.write(msg.pack())
 
     def send(self, msg):
@@ -2395,7 +2537,7 @@ class MitogenProtocol(Protocol):
         """
         Disable :class:`Protocol` immediate disconnect behaviour.
         """
-        _v and LOG.debug('%r: shutting down', self)
+        LOG.debug('%r: shutting down', self)
 
 
 class Context(object):
@@ -2421,20 +2563,24 @@ class Context(object):
     :param str name:
         Context name.
     """
-    name = None
-    remote_name = None
+    ID_MIN = 0
+    ID_MAX = 2**32 - 1
+    NAME_MAX_LEN = 500
 
     def __init__(self, router, context_id, name=None):
+        _require_bounds(context_id, Context.ID_MIN, Context.ID_MAX)
+        if name is not None:
+            name = _ensure_text(name)
+            _require_length(name, 0, Context.NAME_MAX_LEN)
         self.router = router
         self.context_id = context_id
-        if name:
-            self.name = to_text(name)
+        self.name = name
 
     def __reduce__(self):
         return _unpickle_context, (self.context_id, self.name)
 
     def on_disconnect(self):
-        _v and LOG.debug('%r: disconnecting', self)
+        LOG.debug('%r: disconnecting', self)
         fire(self, 'disconnect')
 
     def send_async(self, msg, persist=False):
@@ -2459,7 +2605,7 @@ class Context(object):
         msg.dst_id = self.context_id
         msg.reply_to = receiver.handle
 
-        _v and LOG.debug('sending message to %r: %r', self, msg)
+        LOG.debug('sending message to %r: %r', self, msg)
         self.send(msg)
         return receiver
 
@@ -2468,7 +2614,7 @@ class Context(object):
             service_name = service_name.encode('utf-8')
         elif not isinstance(service_name, UnicodeType):
             service_name = service_name.name()  # Service.name()
-        _v and LOG.debug('calling service %s.%s of %r, args: %r',
+        LOG.debug('calling service %s.%s of %r, args: %r',
                          service_name, method_name, self, kwargs)
         tup = (service_name, to_text(method_name), Kwargs(kwargs))
         msg = Message.pickled(tup, handle=CALL_SERVICE)
@@ -2506,7 +2652,7 @@ class Context(object):
         receiver = self.send_async(msg)
         response = receiver.get(deadline)
         data = response.unpickle()
-        _vv and IOLOG.debug('%r._send_await() -> %r', self, data)
+        IOLOG.debug('%r._send_await() -> %r', self, data)
         return data
 
     def __repr__(self):
@@ -2514,11 +2660,11 @@ class Context(object):
 
 
 def _unpickle_context(context_id, name, router=None):
-    if not (isinstance(context_id, integer_types) and context_id >= 0 and (
-        (name is None) or
-        (isinstance(name, UnicodeType) and len(name) < 100))
-    ):
-        raise TypeError('cannot unpickle Context: bad input')
+    _require_types(context_id, integer_types)
+    _require_bounds(context_id, Context.ID_MIN, Context.ID_MAX)
+    if name is not None:
+        _require_types(name, (UnicodeType,))
+        _require_length(name, 0, Context.NAME_MAX_LEN)
 
     if isinstance(router, Router):
         return router.context_by_id(context_id, name=name)
@@ -2638,13 +2784,13 @@ class Poller(object):
         )
 
         for fd in rfds:
-            _vv and IOLOG.debug('%r: POLLIN for %r', self, fd)
+            IOLOG.debug('%r: POLLIN for %r', self, fd)
             data, gen = self._rfds.get(fd, (None, None))
             if gen and gen < self._generation:
                 yield data
 
         for fd in wfds:
-            _vv and IOLOG.debug('%r: POLLOUT for %r', self, fd)
+            IOLOG.debug('%r: POLLOUT for %r', self, fd)
             data, gen = self._wfds.get(fd, (None, None))
             if gen and gen < self._generation:
                 yield data
@@ -2659,7 +2805,7 @@ class Poller(object):
         :returns:
             Iterable of `data` elements associated with ready FDs.
         """
-        _vv and IOLOG.debug('%r.poll(%r)', self, timeout)
+        IOLOG.debug('%r.poll(%r)', self, timeout)
         self._generation += 1
         return self._poll(timeout)
 
@@ -2785,7 +2931,7 @@ class Latch(object):
         try:
             return self._cls_idle_socketpairs.pop()  # pop() must be atomic
         except IndexError:
-            rsock, wsock = socket.socketpair()
+            rsock, wsock = socketpair()
             rsock.setblocking(False)
             set_cloexec(rsock.fileno())
             set_cloexec(wsock.fileno())
@@ -2825,7 +2971,7 @@ class Latch(object):
         :returns:
             The de-queued object.
         """
-        _vv and IOLOG.debug('%r.get(timeout=%r, block=%r)',
+        IOLOG.debug('%r.get(timeout=%r, block=%r)',
                             self, timeout, block)
         self._lock.acquire()
         try:
@@ -2833,7 +2979,7 @@ class Latch(object):
                 raise LatchError()
             i = len(self._sleeping)
             if len(self._queue) > i:
-                _vv and IOLOG.debug('%r.get() -> %r', self, self._queue[i])
+                IOLOG.debug('%r.get() -> %r', self, self._queue[i])
                 return self._queue.pop(i)
             if not block:
                 raise TimeoutError()
@@ -2855,7 +3001,7 @@ class Latch(object):
         When a result is not immediately available, sleep waiting for
         :meth:`put` to write a byte to our socket pair.
         """
-        _vv and IOLOG.debug(
+        IOLOG.debug(
             '%r._get_sleep(timeout=%r, block=%r, fd=%d/%d)',
             self, timeout, block, rsock.fileno(), wsock.fileno()
         )
@@ -2895,7 +3041,7 @@ class Latch(object):
             self._waking -= 1
             if self.closed:
                 raise LatchError()
-            _vv and IOLOG.debug('%r.get() wake -> %r', self, self._queue[i])
+            IOLOG.debug('%r.get() wake -> %r', self, self._queue[i])
             return self._queue.pop(i)
         finally:
             self._lock.release()
@@ -2911,7 +3057,7 @@ class Latch(object):
         :raises mitogen.core.LatchError:
             :meth:`close` has been called, and the object is no longer valid.
         """
-        _vv and IOLOG.debug('%r.put(%r)', self, obj)
+        IOLOG.debug('%r.put(%r)', self, obj)
         self._lock.acquire()
         try:
             if self.closed:
@@ -2922,7 +3068,7 @@ class Latch(object):
             if self._waking < len(self._sleeping):
                 wsock, cookie = self._sleeping[self._waking]
                 self._waking += 1
-                _vv and IOLOG.debug('%r.put() -> waking wfd=%r',
+                IOLOG.debug('%r.put() -> waking wfd=%r',
                                     self, wsock.fileno())
             elif self.notify:
                 self.notify(self)
@@ -2958,7 +3104,8 @@ class Waker(Protocol):
     @classmethod
     def build_stream(cls, broker):
         stream = super(Waker, cls).build_stream(broker)
-        stream.accept(*pipe())
+        rfp, wfp = pipe(blocking=False)
+        stream.accept(rfp, wfp)
         return stream
 
     def __init__(self, broker):
@@ -2984,7 +3131,7 @@ class Waker(Protocol):
         synchronized, :meth:`defer` and :meth:`on_receive` can conspire to
         ensure only one byte needs to be pending regardless of queue length.
         """
-        _vv and IOLOG.debug('%r.on_receive()', self)
+        IOLOG.debug('%r.on_receive()', self)
         while True:
             try:
                 func, args, kwargs = self._deferred.popleft()
@@ -3026,12 +3173,12 @@ class Waker(Protocol):
             :meth:`defer` was called after :class:`Broker` has begun shutdown.
         """
         if thread.get_ident() == self.broker_ident:
-            _vv and IOLOG.debug('%r.defer() [immediate]', self)
+            IOLOG.debug('%r.defer() [immediate]', self)
             return func(*args, **kwargs)
         if self._broker._exitted:
             raise Error(self.broker_shutdown_msg)
 
-        _vv and IOLOG.debug('%r.defer() [fd=%r]', self,
+        IOLOG.debug('%r.defer() [fd=%r]', self,
                             self.stream.transmit_side.fd)
         self._deferred.append((func, args, kwargs))
         self._wake()
@@ -3056,7 +3203,8 @@ class IoLoggerProtocol(DelimitedProtocol):
         prevent break :meth:`on_shutdown` from calling :meth:`shutdown()
         <socket.socket.shutdown>` on it.
         """
-        rsock, wsock = socket.socketpair()
+        # Leave wsock & dest_fd blocking, so the subprocess will have sane stdio
+        rsock, wsock = socketpair()
         os.dup2(wsock.fileno(), dest_fd)
         stream = super(IoLoggerProtocol, cls).build_stream(name)
         stream.name = name
@@ -3078,7 +3226,7 @@ class IoLoggerProtocol(DelimitedProtocol):
         without the buffer continuously refilling due to some out of control
         child process.
         """
-        _v and LOG.debug('%r: shutting down', self)
+        LOG.debug('%r: shutting down', self)
         if not IS_WSL:
             # #333: WSL generates invalid readiness indication on shutdown().
             # This modifies the *kernel object* inherited by children, causing
@@ -3143,7 +3291,6 @@ class Router(object):
     def __init__(self, broker):
         self.broker = broker
         listen(broker, 'exit', self._on_broker_exit)
-        self._setup_logging()
 
         self._write_lock = threading.Lock()
         #: context ID -> Stream; must hold _write_lock to edit or iterate
@@ -3159,18 +3306,6 @@ class Router(object):
 
     def __repr__(self):
         return 'Router(%r)' % (self.broker,)
-
-    def _setup_logging(self):
-        """
-        This is done in the :class:`Router` constructor for historical reasons.
-        It must be called before ExternalContext logs its first messages, but
-        after logging has been setup. It must also be called when any router is
-        constructed for a consumer app.
-        """
-        # Here seems as good a place as any.
-        global _v, _vv
-        _v = logging.getLogger().level <= logging.DEBUG
-        _vv = IOLOG.level <= logging.DEBUG
 
     def _on_del_route(self, msg):
         """
@@ -3212,7 +3347,7 @@ class Router(object):
         Called prior to broker exit, informs callbacks registered with
         :meth:`add_handler` the connection is dead.
         """
-        _v and LOG.debug('%r: broker has exitted', self)
+        LOG.debug('%r: broker has exitted', self)
         while self._handle_map:
             _, (_, func, _, _) = self._handle_map.popitem()
             func(Message.dead(self.broker_exit_msg))
@@ -3278,7 +3413,7 @@ class Router(object):
         the stream's receive side to the I/O multiplexer. This method remains
         public while the design has not yet settled.
         """
-        _v and LOG.debug('%s: registering %r to stream %r',
+        LOG.debug('%s: registering %r to stream %r',
                          self, context, stream)
         self._write_lock.acquire()
         try:
@@ -3376,7 +3511,7 @@ class Router(object):
             Attemp to register handle that was already registered.
         """
         handle = handle or next(self._last_handle)
-        _vv and IOLOG.debug('%r.add_handler(%r, %r, %r)', self, fn, handle, persist)
+        IOLOG.debug('%r.add_handler(%r, %r, %r)', self, fn, handle, persist)
         if handle in self._handle_map and not overwrite:
             raise Error(self.duplicate_handle_msg)
 
@@ -3469,7 +3604,7 @@ class Router(object):
             performing source route verification, to ensure sensitive messages
             such as ``CALL_FUNCTION`` arrive only from trusted contexts.
         """
-        _vv and IOLOG.debug('%r._async_route(%r, %r)', self, msg, in_stream)
+        IOLOG.debug('%r._async_route(%r, %r)', self, msg, in_stream)
 
         if len(msg.data) > self.max_message_size:
             self._maybe_send_dead(False, msg, self.too_large_msg % (
@@ -3614,7 +3749,7 @@ class Broker(object):
         file descriptor becomes ready for reading,
         :meth:`BasicStream.on_receive` will be called.
         """
-        _vv and IOLOG.debug('%r.start_receive(%r)', self, stream)
+        IOLOG.debug('%r.start_receive(%r)', self, stream)
         side = stream.receive_side
         assert side and not side.closed
         self.defer(self.poller.start_receive,
@@ -3625,7 +3760,7 @@ class Broker(object):
         Mark the :attr:`receive_side <Stream.receive_side>` on `stream` as not
         ready for reading. Safe to call from any thread.
         """
-        _vv and IOLOG.debug('%r.stop_receive(%r)', self, stream)
+        IOLOG.debug('%r.stop_receive(%r)', self, stream)
         self.defer(self.poller.stop_receive, stream.receive_side.fd)
 
     def _start_transmit(self, stream):
@@ -3635,7 +3770,7 @@ class Broker(object):
         associated file descriptor becomes ready for writing,
         :meth:`BasicStream.on_transmit` will be called.
         """
-        _vv and IOLOG.debug('%r._start_transmit(%r)', self, stream)
+        IOLOG.debug('%r._start_transmit(%r)', self, stream)
         side = stream.transmit_side
         assert side and not side.closed
         self.poller.start_transmit(side.fd, (side, stream.on_transmit))
@@ -3645,7 +3780,7 @@ class Broker(object):
         Mark the :attr:`transmit_side <Stream.receive_side>` on `stream` as not
         ready for writing.
         """
-        _vv and IOLOG.debug('%r._stop_transmit(%r)', self, stream)
+        IOLOG.debug('%r._stop_transmit(%r)', self, stream)
         self.poller.stop_transmit(stream.transmit_side.fd)
 
     def keep_alive(self):
@@ -3697,7 +3832,7 @@ class Broker(object):
         :param float timeout:
             If not :data:`None`, maximum time in seconds to wait for events.
         """
-        _vv and IOLOG.debug('%r._loop_once(%r, %r)',
+        IOLOG.debug('%r._loop_once(%r, %r)',
                             self, timeout, self.poller)
 
         timer_to = self.timers.get_timeout()
@@ -3780,7 +3915,7 @@ class Broker(object):
         Request broker gracefully disconnect streams and stop. Safe to call
         from any thread.
         """
-        _v and LOG.debug('%r: shutting down', self)
+        LOG.debug('%r: shutting down', self)
         def _shutdown():
             self._alive = False
         if self._alive and not self._exitted:
@@ -3847,7 +3982,7 @@ class Dispatcher(object):
 
     def _parse_request(self, msg):
         data = msg.unpickle(throw=False)
-        _v and LOG.debug('%r: dispatching %r', self, data)
+        LOG.debug('%r: dispatching %r', self, data)
 
         chain_id, modname, klass, func, args, kwargs = data
         obj = import_module(modname)
@@ -3918,7 +4053,7 @@ class Dispatcher(object):
                 continue
 
             chain_id, ret = self._dispatch_one(msg)
-            _v and LOG.debug('%r: %r -> %r', self, msg, ret)
+            LOG.debug('%r: %r -> %r', self, msg, ret)
             if msg.reply_to:
                 msg.reply(ret)
             elif isinstance(ret, CallError) and chain_id is None:
@@ -3977,7 +4112,7 @@ class ExternalContext(object):
 
     def _on_shutdown_msg(self, msg):
         if not msg.is_dead:
-            _v and LOG.debug('shutdown request from context %d', msg.src_id)
+            LOG.debug('shutdown request from context %d', msg.src_id)
             self.broker.shutdown()
 
     def _on_parent_disconnect(self):
@@ -3986,7 +4121,7 @@ class ExternalContext(object):
             mitogen.parent_id = None
             LOG.info('Detachment complete')
         else:
-            _v and LOG.debug('parent stream is gone, dying.')
+            LOG.debug('parent stream is gone, dying.')
             self.broker.shutdown()
 
     def detach(self):
@@ -4038,6 +4173,9 @@ class ExternalContext(object):
             local_id=self.config['context_id'],
             parent_ids=self.config['parent_ids']
         )
+        for f in in_fp, out_fp:
+            fd = f.fileno()
+            set_blocking(fd, False)
         self.stream.accept(in_fp, out_fp)
         self.stream.name = 'parent'
         self.stream.receive_side.keep_alive = False
@@ -4052,9 +4190,10 @@ class ExternalContext(object):
             pass  # No first stage exists (e.g. fakessh)
 
     def _setup_logging(self):
+        for name, level in zip(LOGGERS, self.config['log_levels']):
+            logging.getLogger(name).setLevel(level)
         self.log_handler = LogHandler(self.master)
         root = logging.getLogger()
-        root.setLevel(self.config['log_level'])
         root.handlers = [self.log_handler]
         if self.config['debug']:
             enable_debug_logging()
@@ -4077,17 +4216,24 @@ class ExternalContext(object):
             else:
                 core_src = None
 
+            policy = ImportPolicy(
+                self.config['import_overrides'],
+                self.config['import_blocks'],
+            )
             importer = Importer(
                 self.router,
                 self.parent,
                 core_src,
-                self.config.get('whitelist', ()),
-                self.config.get('blacklist', ()),
+                policy,
             )
 
         self.importer = importer
         self.router.importer = importer
         sys.meta_path.insert(0, self.importer)
+
+    def _setup_resource_requester(self):
+        resource_getter = ResourceRequester(self.router, self.parent)
+        self.importer._resource_requester = resource_getter
 
     def _setup_package(self):
         global mitogen
@@ -4178,6 +4324,7 @@ class ExternalContext(object):
             try:
                 self._setup_logging()
                 self._setup_importer()
+                self._setup_resource_requester()
                 self._reap_first_stage()
                 if self.config.get('setup_package', True):
                     self._setup_package()
@@ -4187,26 +4334,26 @@ class ExternalContext(object):
 
                 self.dispatcher = Dispatcher(self)
                 self.router.register(self.parent, self.stream)
-                self.router._setup_logging()
 
-                _v and LOG.debug('Python version is %s', sys.version)
-                _v and LOG.debug('Parent is context %r (%s); my ID is %r',
+                if LOG.isEnabledFor(logging.DEBUG):
+                    LOG.debug('Python version is %s', sys.version)
+                    LOG.debug('Parent is context %r (%s); my ID is %r',
                                  self.parent.context_id, self.parent.name,
                                  mitogen.context_id)
-                _v and LOG.debug('pid:%r ppid:%r uid:%r/%r, gid:%r/%r host:%r',
+                    LOG.debug('pid:%r ppid:%r uid:%r/%r, gid:%r/%r host:%r',
                                  os.getpid(), os.getppid(), os.geteuid(),
                                  os.getuid(), os.getegid(), os.getgid(),
                                  socket.gethostname())
 
                 sys.executable = os.environ.pop('ARGV0', sys.executable)
-                _v and LOG.debug('Recovered sys.executable: %r', sys.executable)
+                LOG.debug('Recovered sys.executable: %r', sys.executable)
 
                 if self.config.get('send_ec2', True):
                     self.stream.transmit_side.write(b('MITO002\n'))
                 self.broker._py24_25_compat()
                 self.log_handler.uncork()
                 self.dispatcher.run()
-                _v and LOG.debug('ExternalContext.main() normal exit')
+                LOG.debug('ExternalContext.main() normal exit')
             except KeyboardInterrupt:
                 LOG.debug('KeyboardInterrupt received, exiting gracefully.')
             except BaseException:

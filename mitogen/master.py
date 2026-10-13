@@ -35,10 +35,8 @@ be sent to any context that will be used to establish additional child
 contexts.
 """
 
-import dis
 import errno
 import inspect
-import itertools
 import logging
 import os
 import pkgutil
@@ -49,9 +47,10 @@ import threading
 import types
 import zlib
 
-try:
-    # Python >= 3.4, PEP 451 ModuleSpec API
-    import importlib.machinery
+if sys.version_info >= (3, 7):
+    import importlib.resources
+
+if sys.version_info >= (3, 4):
     import importlib.util
     from _imp import is_builtin as _is_builtin
 
@@ -65,24 +64,23 @@ try:
             return maybe_spec.loader
         except AttributeError:
             return None
-except ImportError:
-    # Python < 3.4, PEP 302 Import Hooks
+else:
     import imp
     from imp import is_builtin as _is_builtin
 
-    try:
+    if sys.version_info >= (2, 5):
         from pkgutil import find_loader as _find_loader
-    except ImportError:
-        # Python < 2.5
+    else:
         from mitogen.compat.pkgutil import find_loader as _find_loader
 
-try:
+if sys.version_info >= (2, 7):
     import sysconfig
-except ImportError:
+else:
     sysconfig = None
 
 import mitogen
 import mitogen.core
+import mitogen.imports
 import mitogen.minify
 import mitogen.parent
 
@@ -90,13 +88,9 @@ from mitogen.core import any
 from mitogen.core import b
 from mitogen.core import IOLOG
 from mitogen.core import LOG
-from mitogen.core import next
 from mitogen.core import str_partition
 from mitogen.core import str_rpartition
 from mitogen.core import to_text
-
-imap = getattr(itertools, 'imap', map)
-izip = getattr(itertools, 'izip', zip)
 
 RLOG = logging.getLogger('mitogen.ctx')
 
@@ -150,9 +144,11 @@ def is_stdlib_name(modname):
     if module is None:
         return False
 
-    # six installs crap with no __file__
-    modpath = os.path.abspath(getattr(module, '__file__', ''))
-    return is_stdlib_path(modpath)
+    origin = getattr(module, '__file__', None)
+    if origin is None:
+        return False
+
+    return is_stdlib_path(os.path.abspath(origin))
 
 
 _STDLIB_PATHS = _stdlib_paths()
@@ -251,80 +247,6 @@ def _get_core_source():
 if mitogen.is_master:
     # TODO: find a less surprising way of installing this.
     mitogen.parent._get_core_source = _get_core_source
-
-
-LOAD_CONST = dis.opname.index('LOAD_CONST')
-IMPORT_NAME = dis.opname.index('IMPORT_NAME')
-
-
-def _getarg(nextb, c):
-    if c >= dis.HAVE_ARGUMENT:
-        return nextb() | (nextb() << 8)
-
-
-if sys.version_info < (3, 0):
-    def iter_opcodes(co):
-        # Yield `(op, oparg)` tuples from the code object `co`.
-        ordit = imap(ord, co.co_code)
-        nextb = ordit.next
-        return ((c, _getarg(nextb, c)) for c in ordit)
-elif sys.version_info < (3, 6):
-    def iter_opcodes(co):
-        # Yield `(op, oparg)` tuples from the code object `co`.
-        ordit = iter(co.co_code)
-        nextb = ordit.__next__
-        return ((c, _getarg(nextb, c)) for c in ordit)
-else:
-    def iter_opcodes(co):
-        # Yield `(op, oparg)` tuples from the code object `co`.
-        ordit = iter(co.co_code)
-        nextb = ordit.__next__
-        # https://github.com/abarnert/cpython/blob/c095a32f/Python/wordcode.md
-        return ((c, nextb()) for c in ordit)
-
-
-def scan_code_imports(co):
-    """
-    Given a code object `co`, scan its bytecode yielding any ``IMPORT_NAME``
-    and associated prior ``LOAD_CONST`` instructions representing an `Import`
-    statement or `ImportFrom` statement.
-
-    :return:
-        Generator producing `(level, modname, namelist)` tuples, where:
-
-        * `level`: -1 for normal import, 0, for absolute import, and >0 for
-          relative import.
-        * `modname`: Name of module to import, or from where `namelist` names
-          are imported.
-        * `namelist`: for `ImportFrom`, the list of names to be imported from
-          `modname`.
-    """
-    opit = iter_opcodes(co)
-    opit, opit2, opit3 = itertools.tee(opit, 3)
-
-    try:
-        next(opit2)
-        next(opit3)
-        next(opit3)
-    except StopIteration:
-        return
-
-    if sys.version_info >= (2, 5):
-        for oparg1, oparg2, (op3, arg3) in izip(opit, opit2, opit3):
-            if op3 == IMPORT_NAME:
-                op2, arg2 = oparg2
-                op1, arg1 = oparg1
-                if op1 == op2 == LOAD_CONST:
-                    yield (co.co_consts[arg1],
-                           co.co_names[arg3],
-                           co.co_consts[arg2] or ())
-    else:
-        # Python 2.4 did not yet have 'level', so stack format differs.
-        for oparg1, (op2, arg2) in izip(opit, opit2):
-            if op2 == IMPORT_NAME:
-                op1, arg1 = oparg1
-                if op1 == LOAD_CONST:
-                    yield (-1, co.co_names[arg2], co.co_consts[arg1] or ())
 
 
 class ThreadWatcher(object):
@@ -449,15 +371,19 @@ class LogForwarder(object):
         if logger is None:
             self._cache[logger_name] = logger = logging.getLogger(logger_name)
 
+        levelno = int(level_s)
         # See logging.Handler.makeRecord()
-        record = logging.LogRecord(
-            name=logger.name,
-            level=int(level_s),
-            pathname='(unknown file)',
-            lineno=0,
-            msg=s,
-            args=(),
-            exc_info=None,
+        record = logging.makeLogRecord(
+            {
+                "name": logger.name,
+                "levelname": logging.getLevelName(levelno),
+                "levelno": levelno,
+                "pathname": "(unknown file)",
+                "lineno": 0,
+                "msg": s,
+                "args": (),
+                "exc_info": None,
+            }
         )
         record.mitogen_message = s
         record.mitogen_context = self._router.context_by_id(msg.src_id)
@@ -918,6 +844,12 @@ class ModuleFinder(object):
     related modules likely needed by a child context requesting the original
     module.
     """
+
+    # Fullnames of modules that should not be sent as a related module
+    _related_modules_denylist = frozenset({
+        '__main__',
+    })
+
     def __init__(self):
         #: Import machinery is expensive, keep :py:meth`:get_module_source`
         #: results around.
@@ -926,13 +858,29 @@ class ModuleFinder(object):
         #: Avoid repeated dependency scanning, which is expensive.
         self._related_cache = {}
 
+        # Registered source code modifier functions
+        self._modifier_callables = {}
+
     def __repr__(self):
         return 'ModuleFinder()'
+
+    def add_source_modifier(self, fullname, callable):
+        """
+        Register a modifier function, it will be called if/when that module is
+        found.
+
+        :param str fullname:
+            Fully qualified name of the module to be modified.
+        :param Callable callable:
+            Callable that returns the modified get_module_source result.
+        """
+        self._modifier_callables.setdefault(fullname, []).append(callable)
+        LOG.debug('Modifier %s registered for %s', callable, fullname)
 
     def add_source_override(self, fullname, path, source, is_pkg):
         """
         Explicitly install a source cache entry, preventing usual lookup
-        methods from being used.
+        methods and modifiers from being used.
 
         Beware the value of `path` is critical when `is_pkg` is specified,
         since it directs where submodules are searched for.
@@ -972,7 +920,7 @@ class ModuleFinder(object):
         for method in self.get_module_methods:
             tup = method.find(fullname)
             if tup:
-                #LOG.debug('%r returned %r', method, tup)
+                tup = self._apply_modifiers(fullname, *tup)
                 break
         else:
             tup = None, None, None
@@ -1006,6 +954,34 @@ class ModuleFinder(object):
             fullname, _, _ = str_rpartition(to_text(fullname), u'.')
             yield fullname
 
+    def _reject_related_module(self, requested_fullname, related_fullname):
+        def _log_reject(reason):
+            LOG.debug(
+                '%r: Rejected related module %s of requested module %s: %s',
+                self, related_fullname, requested_fullname, reason,
+            )
+            return reason
+
+        try:
+            related_module = sys.modules[related_fullname]
+        except KeyError:
+            return _log_reject('sys.modules entry absent')
+
+        # Python 2.x "indirection entry"
+        if related_module is None:
+            return _log_reject('sys.modules entry is None')
+
+        if is_stdlib_name(related_fullname):
+            return _log_reject('stdlib module')
+
+        if 'six.moves' in related_fullname:
+            return _log_reject('six.moves avoidence')
+
+        if related_fullname in self._related_modules_denylist:
+            return _log_reject('on denylist')
+
+        return False
+
     def find_related_imports(self, fullname):
         """
         Return a list of non-stdlib modules that are directly imported by
@@ -1029,7 +1005,7 @@ class ModuleFinder(object):
         maybe_names = list(self.generate_parent_names(fullname))
 
         co = compile(src, modpath, 'exec')
-        for level, modname, namelist in scan_code_imports(co):
+        for level, modname, namelist in mitogen.imports.codeobj_imports(co):
             if level == -1:
                 modnames = [modname, '%s.%s' % (fullname, modname)]
             else:
@@ -1048,9 +1024,7 @@ class ModuleFinder(object):
             set(
                 mitogen.core.to_text(name)
                 for name in maybe_names
-                if sys.modules.get(name) is not None
-                and not is_stdlib_name(name)
-                and u'six.moves' not in name  # TODO: crap
+                if not self._reject_related_module(fullname, name)
             )
         ))
 
@@ -1078,15 +1052,21 @@ class ModuleFinder(object):
         found.discard(fullname)
         return sorted(found)
 
+    def _apply_modifiers(self, fullname, path, source, is_pkg):
+        for callable in self._modifier_callables.get(fullname, []):
+            path, source, is_pkg = callable(fullname, path, source, is_pkg)
+            LOG.debug('Modifier %s applied to %s', callable, fullname)
+
+        return (path, source, is_pkg)
+
 
 class ModuleResponder(object):
-    def __init__(self, router):
+    def __init__(self, router, policy):
         self._log = logging.getLogger('mitogen.responder')
         self._router = router
         self._finder = ModuleFinder()
         self._cache = {}  # fullname -> pickled
-        self.blacklist = []
-        self.whitelist = ['']
+        self.policy = policy
 
         #: Context -> set([fullname, ..])
         self._forwarded_by_context = {}
@@ -1112,6 +1092,9 @@ class ModuleResponder(object):
     def __repr__(self):
         return 'ModuleResponder'
 
+    def add_source_modifier(self, fullname, callable):
+        self._finder.add_source_modifier(fullname, callable)
+
     def add_source_override(self, fullname, path, source, is_pkg):
         """
         See :meth:`ModuleFinder.add_source_override`.
@@ -1129,12 +1112,12 @@ class ModuleResponder(object):
     )
 
     def whitelist_prefix(self, fullname):
-        if self.whitelist == ['']:
-            self.whitelist = ['mitogen']
-        self.whitelist.append(fullname)
+        if not self.policy.overrides:
+            self.policy.overrides.add('mitogen')
+        self.policy.overrides.add(fullname)
 
     def blacklist_prefix(self, fullname):
-        self.blacklist.append(fullname)
+        self.policy.blocks.add(fullname)
 
     def neutralize_main(self, path, src):
         """
@@ -1161,8 +1144,7 @@ class ModuleResponder(object):
         if fullname in self._cache:
             return self._cache[fullname]
 
-        if mitogen.core.is_blacklisted_import(self, fullname):
-            raise ImportError('blacklisted')
+        self.policy.denied_raise(fullname)
 
         path, source, is_pkg = self._finder.get_module_source(fullname)
         if path and is_stdlib_path(path):
@@ -1200,7 +1182,7 @@ class ModuleResponder(object):
         related = [
             to_text(name)
             for name in self._finder.find_related(fullname)
-            if not mitogen.core.is_blacklisted_import(self, name)
+            if not self.policy.denied(name)
         ]
         # 0:fullname 1:pkg_present 2:path 3:compressed 4:related
         tup = (
@@ -1213,7 +1195,7 @@ class ModuleResponder(object):
         self._cache[fullname] = tup
         return tup
 
-    def _send_load_module(self, stream, fullname):
+    def _send_load_module(self, stream, fullname, reason):
         if fullname not in stream.protocol.sent_modules:
             tup = self._build_tuple(fullname)
             msg = mitogen.core.Message.pickled(
@@ -1221,8 +1203,10 @@ class ModuleResponder(object):
                 dst_id=stream.protocol.remote_id,
                 handle=mitogen.core.LOAD_MODULE,
             )
-            self._log.debug('sending %s (%.2f KiB) to %s',
-                            fullname, len(msg.data) / 1024.0, stream.name)
+            self._log.debug(
+                'sending %s %s (%.2f KiB) to %s',
+                reason, fullname, len(msg.data) / 1024.0, stream.name,
+            )
             self._router._async_route(msg)
             stream.protocol.sent_modules.add(fullname)
             if tup[2] is not None:
@@ -1253,8 +1237,8 @@ class ModuleResponder(object):
                     # Parent hasn't been sent, so don't load submodule yet.
                     continue
 
-                self._send_load_module(stream, name)
-            self._send_load_module(stream, fullname)
+                self._send_load_module(stream, name, 'related')
+            self._send_load_module(stream, fullname, 'requested')
         except Exception:
             LOG.debug('While importing %r', fullname, exc_info=True)
             self._send_module_load_failed(stream, fullname)
@@ -1321,6 +1305,38 @@ class ModuleResponder(object):
 
     def forward_modules(self, context, fullnames):
         self._router.broker.defer(self._forward_modules, context, fullnames)
+
+
+class ResourceResponder(object):
+    def __init__(self, router):
+        self._router = router
+        self._router.add_handler(
+            self._on_get_resource,
+            mitogen.core.GET_RESOURCE,
+        )
+
+    def _on_get_resource(self, msg):
+        if msg.is_dead:
+            return
+        stream = self._router.stream_by_id(msg.src_id)
+        if stream is None:
+            return
+        fullname, resource = msg.unpickle()
+        try:
+            content = importlib.resources.read_binary(fullname, resource)
+        except (FileNotFoundError, IsADirectoryError):
+            content = None
+
+        msg = mitogen.core.Message.pickled(
+            (fullname, resource), content,
+            dst_id=stream.protocol.remote_id,
+            handle=mitogen.core.LOAD_RESOURCE,
+        )
+
+        if content is not None:
+            self._router._async_route(msg)
+        else:
+            stream.protocol.send(msg)
 
 
 class Broker(mitogen.core.Broker):
@@ -1412,7 +1428,8 @@ class Router(mitogen.parent.Router):
 
     def upgrade(self):
         self.id_allocator = IdAllocator(self)
-        self.responder = ModuleResponder(self)
+        self.responder = ModuleResponder(self, mitogen.core.ImportPolicy())
+        self.resource_responder = ResourceResponder(self)
         self.log_forwarder = LogForwarder(self)
         self.route_monitor = mitogen.parent.RouteMonitor(router=self)
         self.add_handler(  # TODO: cutpaste.

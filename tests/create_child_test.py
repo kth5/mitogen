@@ -85,7 +85,7 @@ def wait_read(fp, n):
         poller.start_receive(fp.fileno())
         for _ in poller.poll():
             return os.read(fp.fileno(), n)
-        assert False
+        raise EnvironmentError('Nothing was ready to read on %r' % (fp,))
     finally:
         poller.close()
 
@@ -190,7 +190,7 @@ class TtyCreateChildTest(testlib.TestCase):
             proc = self.func([
                 'bash', '-c', 'exec 2>%s; echo hi > /dev/tty' % (tf.name,)
             ])
-            mitogen.core.set_block(proc.stdin.fileno())
+            mitogen.core.set_blocking(proc.stdin.fileno(), True)
             # read(3) below due to https://bugs.python.org/issue37696
             self.assertEqual(mitogen.core.b('hi\n'), proc.stdin.read(3))
             waited_pid, status = os.waitpid(proc.pid, 0)

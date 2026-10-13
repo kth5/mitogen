@@ -10,7 +10,6 @@ except ImportError:
     import mock
 
 import ansible_mitogen.target
-import testlib
 
 
 LOGGER_NAME = ansible_mitogen.target.LOG.name
@@ -28,7 +27,7 @@ class NamedTemporaryDirectory(object):
         subprocess.check_call(['rm', '-rf', self.path])
 
 
-class FindGoodTempDirTest(testlib.TestCase):
+class FindGoodTempDirTest(unittest.TestCase):
     func = staticmethod(ansible_mitogen.target.find_good_temp_dir)
 
     def test_expands_usernames(self):
@@ -51,11 +50,10 @@ class FindGoodTempDirTest(testlib.TestCase):
     @mock.patch('ansible_mitogen.target.is_good_temp_dir')
     def test_no_good_candidate(self, is_good_temp_dir):
         is_good_temp_dir.return_value = False
-        e = self.assertRaises(IOError,
-            lambda: self.func([])
-        )
-        self.assertTrue(str(e).startswith('Unable to find a useable'))
+        with self.assertRaises(IOError) as cm:
+            self.func([])
 
+        self.assertTrue(str(cm.exception).startswith('Unable to find a useable'))
 
 
 class ApplyModeSpecTest(unittest.TestCase):
@@ -100,11 +98,5 @@ class IsGoodTempDirTest(unittest.TestCase):
     @mock.patch('os.chmod')
     def test_weird_filesystem(self, os_chmod):
         os_chmod.side_effect = OSError('nope')
-        with NamedTemporaryDirectory() as temp_path:
-            self.assertFalse(self.func(temp_path))
-
-    @mock.patch('os.access')
-    def test_noexec(self, os_access):
-        os_access.return_value = False
         with NamedTemporaryDirectory() as temp_path:
             self.assertFalse(self.func(temp_path))

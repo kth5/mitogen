@@ -51,6 +51,8 @@ LOG = logging.getLogger(__name__)
 # fork is brainwrong from the stone age.
 FORK_SUPPORTED = sys.version_info >= (2, 6)
 
+HAVE_OS_REGISTER_AT_FORK = hasattr(os, 'register_at_fork')
+
 
 class Error(mitogen.core.StreamError):
     pass
@@ -88,8 +90,9 @@ def on_fork():
     Should be called by any program integrating Mitogen each time the process
     is forked, in the context of the new child.
     """
-    reset_logging_framework()  # Must be first!
-    fixup_prngs()
+    if not HAVE_OS_REGISTER_AT_FORK:
+        reset_logging_framework()  # Must be first!
+        fixup_prngs()
     mitogen.core.Latch._on_fork()
     mitogen.core.Side._on_fork()
     mitogen.core.ExternalContext.service_stub_lock = threading.Lock()
@@ -133,7 +136,7 @@ class Process(mitogen.parent.Process):
         except OSError:
             e = sys.exc_info()[1]
             if e.args[0] == errno.ECHILD:
-                LOG.warn('%r: waitpid(%r) produced ECHILD', self, self.pid)
+                LOG.warning('%r: waitpid(%r) produced ECHILD', self, self.pid)
                 return
             raise
 
@@ -211,7 +214,7 @@ class Connection(mitogen.parent.Connection):
         on_fork()
         if self.options.on_fork:
             self.options.on_fork()
-        mitogen.core.set_block(childfp.fileno())
+        mitogen.core.set_blocking(childfp.fileno(), True)
 
         childfp.send(b('MITO002\n'))
 
@@ -236,8 +239,6 @@ class Connection(mitogen.parent.Connection):
         # desired FDs. In that case closing it breaks ExternalContext.main().
         if childfp.fileno() not in (0, 1, 100):
             childfp.close()
-
-        mitogen.core.IOLOG.setLevel(logging.INFO)
 
         try:
             try:

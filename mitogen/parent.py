@@ -79,8 +79,7 @@ except IOError:
     SELINUX_ENABLED = False
 
 
-if mitogen.core.PY3:
-    xrange = range
+if sys.version_info >= (3, 0):
     closure_attr = '__closure__'
     IM_SELF_ATTR = '__self__'
 else:
@@ -150,8 +149,8 @@ _core_source_lock = threading.Lock()
 _core_source_partial = None
 
 
-def get_log_level():
-    return (LOG.getEffectiveLevel() or logging.INFO)
+def get_log_levels(loggers=mitogen.core.LOGGERS):
+    return [logging.getLogger(name).getEffectiveLevel() for name in loggers]
 
 
 def get_sys_executable():
@@ -164,7 +163,7 @@ def get_sys_executable():
 
     global _sys_executable_warning_logged
     if not _sys_executable_warning_logged:
-        LOG.warn(SYS_EXECUTABLE_MSG)
+        LOG.warning(SYS_EXECUTABLE_MSG)
         _sys_executable_warning_logged = True
 
     return '/usr/bin/python'
@@ -265,7 +264,7 @@ def disable_echo(fd):
     termios.tcsetattr(fd, flags, new)
 
 
-def create_socketpair(size=None):
+def create_socketpair(size=None, blocking=None):
     """
     Create a :func:`socket.socketpair` for use as a child's UNIX stdio
     channels. As socketpairs are bidirectional, they are economical on file
@@ -276,14 +275,14 @@ def create_socketpair(size=None):
     if size is None:
         size = mitogen.core.CHUNK_SIZE
 
-    parentfp, childfp = socket.socketpair()
+    parentfp, childfp = mitogen.core.socketpair(blocking)
     for fp in parentfp, childfp:
         fp.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, size)
 
     return parentfp, childfp
 
 
-def create_best_pipe(escalates_privilege=False):
+def create_best_pipe(escalates_privilege=False, blocking=None):
     """
     By default we prefer to communicate with children over a UNIX socket, as a
     single file descriptor can represent bidirectional communication, and a
@@ -301,16 +300,19 @@ def create_best_pipe(escalates_privilege=False):
     :param bool escalates_privilege:
         If :data:`True`, the target program may escalate privileges, causing
         SELinux to disconnect AF_UNIX sockets, so avoid those.
+    :param None|bool blocking:
+        If :data:`False` or :data:`True`, set non-blocking or blocking mode.
+        If :data:`None` (default), use default.
     :returns:
         `(parent_rfp, child_wfp, child_rfp, parent_wfp)`
     """
     if (not escalates_privilege) or (not SELINUX_ENABLED):
-        parentfp, childfp = create_socketpair()
+        parentfp, childfp = create_socketpair(blocking=blocking)
         return parentfp, childfp, childfp, parentfp
 
-    parent_rfp, child_wfp = mitogen.core.pipe()
+    parent_rfp, child_wfp = mitogen.core.pipe(blocking)
     try:
-        child_rfp, parent_wfp = mitogen.core.pipe()
+        child_rfp, parent_wfp = mitogen.core.pipe(blocking)
         return parent_rfp, child_wfp, child_rfp, parent_wfp
     except:
         parent_rfp.close()
@@ -481,7 +483,7 @@ def openpty():
     if not IS_SOLARIS:
         disable_echo(master_fd)
     disable_echo(slave_fd)
-    mitogen.core.set_block(slave_fd)
+    mitogen.core.set_blocking(slave_fd, True)
     return master_fp, slave_fp
 
 
@@ -547,8 +549,8 @@ def hybrid_tty_create_child(args, escalates_privilege=False):
             escalates_privilege=escalates_privilege,
         )
         try:
-            mitogen.core.set_block(child_rfp)
-            mitogen.core.set_block(child_wfp)
+            mitogen.core.set_blocking(child_rfp.fileno(), True)
+            mitogen.core.set_blocking(child_wfp.fileno(), True)
             proc = popen(
                 args=args,
                 stdin=child_rfp,
@@ -958,8 +960,7 @@ class KqueuePoller(mitogen.core.Poller):
         self._kqueue.close()
 
     def _control(self, fd, filters, flags):
-        mitogen.core._vv and IOLOG.debug(
-            '%r._control(%r, %r, %r)', self, fd, filters, flags)
+        IOLOG.debug('%r._control(%r, %r, %r)', self, fd, filters, flags)
         # TODO: at shutdown it is currently possible for KQ_EV_ADD/KQ_EV_DEL
         # pairs to be pending after the associated file descriptor has already
         # been closed. Fixing this requires maintaining extra state, or perhaps
@@ -971,27 +972,25 @@ class KqueuePoller(mitogen.core.Poller):
         assert not events
 
     def start_receive(self, fd, data=None):
-        mitogen.core._vv and IOLOG.debug('%r.start_receive(%r, %r)',
-            self, fd, data)
+        IOLOG.debug('%r.start_receive(%r, %r)', self, fd, data)
         if fd not in self._rfds:
             self._control(fd, select.KQ_FILTER_READ, select.KQ_EV_ADD)
         self._rfds[fd] = (data or fd, self._generation)
 
     def stop_receive(self, fd):
-        mitogen.core._vv and IOLOG.debug('%r.stop_receive(%r)', self, fd)
+        IOLOG.debug('%r.stop_receive(%r)', self, fd)
         if fd in self._rfds:
             self._control(fd, select.KQ_FILTER_READ, select.KQ_EV_DELETE)
             del self._rfds[fd]
 
     def start_transmit(self, fd, data=None):
-        mitogen.core._vv and IOLOG.debug('%r.start_transmit(%r, %r)',
-            self, fd, data)
+        IOLOG.debug('%r.start_transmit(%r, %r)', self, fd, data)
         if fd not in self._wfds:
             self._control(fd, select.KQ_FILTER_WRITE, select.KQ_EV_ADD)
         self._wfds[fd] = (data or fd, self._generation)
 
     def stop_transmit(self, fd):
-        mitogen.core._vv and IOLOG.debug('%r.stop_transmit(%r)', self, fd)
+        IOLOG.debug('%r.stop_transmit(%r)', self, fd)
         if fd in self._wfds:
             self._control(fd, select.KQ_FILTER_WRITE, select.KQ_EV_DELETE)
             del self._wfds[fd]
@@ -1010,12 +1009,12 @@ class KqueuePoller(mitogen.core.Poller):
                 data, gen = self._rfds.get(fd, (None, None))
                 # Events can still be read for an already-discarded fd.
                 if gen and gen < self._generation:
-                    mitogen.core._vv and IOLOG.debug('%r: POLLIN: %r', self, fd)
+                    IOLOG.debug('%r: POLLIN: %r', self, fd)
                     yield data
             elif event.filter == select.KQ_FILTER_WRITE and fd in self._wfds:
                 data, gen = self._wfds.get(fd, (None, None))
                 if gen and gen < self._generation:
-                    mitogen.core._vv and IOLOG.debug('%r: POLLOUT: %r', self, fd)
+                    IOLOG.debug('%r: POLLOUT: %r', self, fd)
                     yield data
 
 
@@ -1036,7 +1035,7 @@ class EpollPoller(mitogen.core.Poller):
         self._epoll.close()
 
     def _control(self, fd):
-        mitogen.core._vv and IOLOG.debug('%r._control(%r)', self, fd)
+        IOLOG.debug('%r._control(%r)', self, fd)
         mask = (((fd in self._rfds) and select.EPOLLIN) |
                 ((fd in self._wfds) and select.EPOLLOUT))
         if mask:
@@ -1050,24 +1049,23 @@ class EpollPoller(mitogen.core.Poller):
             self._registered_fds.remove(fd)
 
     def start_receive(self, fd, data=None):
-        mitogen.core._vv and IOLOG.debug('%r.start_receive(%r, %r)',
-            self, fd, data)
+        IOLOG.debug('%r.start_receive(%r, %r)', self, fd, data)
         self._rfds[fd] = (data or fd, self._generation)
         self._control(fd)
 
     def stop_receive(self, fd):
-        mitogen.core._vv and IOLOG.debug('%r.stop_receive(%r)', self, fd)
+        IOLOG.debug('%r.stop_receive(%r)', self, fd)
         self._rfds.pop(fd, None)
         self._control(fd)
 
     def start_transmit(self, fd, data=None):
-        mitogen.core._vv and IOLOG.debug('%r.start_transmit(%r, %r)',
+        IOLOG.debug('%r.start_transmit(%r, %r)',
             self, fd, data)
         self._wfds[fd] = (data or fd, self._generation)
         self._control(fd)
 
     def stop_transmit(self, fd):
-        mitogen.core._vv and IOLOG.debug('%r.stop_transmit(%r)', self, fd)
+        IOLOG.debug('%r.stop_transmit(%r)', self, fd)
         self._wfds.pop(fd, None)
         self._control(fd)
 
@@ -1082,12 +1080,12 @@ class EpollPoller(mitogen.core.Poller):
                 data, gen = self._rfds.get(fd, (None, None))
                 if gen and gen < self._generation:
                     # Events can still be read for an already-discarded fd.
-                    mitogen.core._vv and IOLOG.debug('%r: POLLIN: %r', self, fd)
+                    IOLOG.debug('%r: POLLIN: %r', self, fd)
                     yield data
             if event & select.EPOLLOUT:
                 data, gen = self._wfds.get(fd, (None, None))
                 if gen and gen < self._generation:
-                    mitogen.core._vv and IOLOG.debug('%r: POLLOUT: %r', self, fd)
+                    IOLOG.debug('%r: POLLOUT: %r', self, fd)
                     yield data
 
 
@@ -1393,10 +1391,6 @@ class Connection(object):
     # with a custom argv.
     #   * Optimized for minimum byte count after minification & compression.
     #     The script preamble_size.py measures this.
-    #   * 'CONTEXT_NAME' and 'PREAMBLE_COMPRESSED_LEN' are substituted with
-    #     their respective values.
-    #   * CONTEXT_NAME must be prefixed with the name of the Python binary in
-    #     order to allow virtualenvs to detect their install prefix.
     #
     # macOS tweaks for Python 2.7 must be kept in sync with the the Ansible
     # module test_echo_module, used by the integration tests.
@@ -1416,9 +1410,8 @@ class Connection(object):
     #   W: write side of interpreter stdin.
     #   r: read side of core_src FD.
     #   w: write side of core_src FD.
-    #   C: the decompressed core source.
 
-    # Final os.close(STDOUT_FILENO) to avoid --py-debug build corrupting stream with
+    # Final os.close(STDERR_FILENO) to avoid --py-debug build corrupting stream with
     # "[1234 refs]" during exit.
     @staticmethod
     def _first_stage():
@@ -1432,20 +1425,30 @@ class Connection(object):
             os.close(r)
             os.close(W)
             os.close(w)
-            if os.uname()[0]=='Darwin'and os.uname()[2][:2]<'19'and sys.executable=='/usr/bin/python':sys.executable='/usr/bin/python2.7'
-            if os.uname()[0]=='Darwin'and os.uname()[2][:2]in'2021'and sys.version[:3]=='2.7':os.environ['PYTHON_LAUNCHED_FROM_WRAPPER']='1'
+            if os.uname()[0]+os.uname()[2][:2]+sys.executable=='Darwin19/usr/bin/python':sys.executable+='2.7'
+            if os.uname()[0]+os.uname()[2][:2]+sys.version[:3]=='Darwin202.7':os.environ['PYTHON_LAUNCHED_FROM_WRAPPER']='1'
+            if os.uname()[0]+os.uname()[2][:2]+sys.version[:3]=='Darwin212.7':os.environ['PYTHON_LAUNCHED_FROM_WRAPPER']='1'
             os.environ['ARGV0']=sys.executable
-            os.execl(sys.executable,sys.executable+'(mitogen:CONTEXT_NAME)')
+            os.execl(sys.executable,sys.executable+'(mitogen:%s)'%sys.argv[2])
         os.write(1,'MITO000\n'.encode())
-        fp=os.fdopen(0,'rb')
-        C=zlib.decompress(fp.read(PREAMBLE_COMPRESSED_LEN))
-        fp.close()
-        fp=os.fdopen(W,'wb',0)
-        fp.write(C)
-        fp.close()
-        fp=os.fdopen(w,'wb',0)
-        fp.write(C)
-        fp.close()
+        # Size of the compressed core source to be read
+        n=int(sys.argv[3])
+        # Read `len(compressed preamble)` bytes sent by our Mitogen parent.
+        # `select()` handles non-blocking stdin (e.g. sudo + log_output).
+        # `C` accumulates compressed bytes.
+        C=''.encode()
+        # data chunk
+        V='V'
+        # Stop looping if no more data is needed or EOF is detected (empty bytes).
+        while n-len(C) and V:select.select([0],[],[]);V=os.read(0,n-len(C));C+=V
+        # Raises `zlib.error` if compressed preamble is truncated or invalid
+        C=zlib.decompress(C)
+        f=os.fdopen(W,'wb',0)
+        f.write(C)
+        f.close()
+        f=os.fdopen(w,'wb',0)
+        f.write(C)
+        f.close()
         os.write(1,'MITO001\n'.encode())
         os.close(2)
 
@@ -1463,39 +1466,45 @@ class Connection(object):
         return [self.options.python_path]
 
     def get_boot_command(self):
-        source = inspect.getsource(self._first_stage)
-        source = textwrap.dedent('\n'.join(source.strip().split('\n')[2:]))
+        lines = inspect.getsourcelines(self._first_stage)[0][2:]
+        # Remove line comments, leading indentation, trailing newline
+        source = textwrap.dedent(''.join(s for s in lines if '#' not in s))[:-1]
         source = source.replace('    ', ' ')
-        source = source.replace('CONTEXT_NAME', self.options.remote_name)
-        preamble_compressed = self.get_preamble()
-        source = source.replace('PREAMBLE_COMPRESSED_LEN',
-                                str(len(preamble_compressed)))
-        compressed = zlib.compress(source.encode(), 9)
+        compressor = zlib.compressobj(
+            zlib.Z_BEST_COMPRESSION, zlib.DEFLATED, -zlib.MAX_WBITS,
+        )
+        compressed = compressor.compress(source.encode()) + compressor.flush()
         encoded = binascii.b2a_base64(compressed).replace(b('\n'), b(''))
 
         # Just enough to decode, decompress, and exec the first stage.
         # Priorities: wider compatibility, faster startup, shorter length.
-        # `import os` here, instead of stage 1, to save a few bytes.
         # `sys.path=...` for https://github.com/python/cpython/issues/115911.
+        # `import os,select` here (not stage 1) to save a few bytes overall.
         return self.get_python_argv() + [
             '-c',
-            'import sys;sys.path=[p for p in sys.path if p];import binascii,os,zlib;'
-            'exec(zlib.decompress(binascii.a2b_base64("%s")))' % (encoded.decode(),),
+            'import sys;sys.path=[p for p in sys.path if p];'
+            'import binascii,os,select,zlib;'
+            'exec(zlib.decompress(binascii.a2b_base64(sys.argv[1]),-15))',
+            encoded.decode(),
+            self.options.remote_name,
+            str(len(self.get_preamble())),
         ]
 
     def get_econtext_config(self):
         assert self.options.max_message_size is not None
         parent_ids = mitogen.parent_ids[:]
         parent_ids.insert(0, mitogen.context_id)
+        if mitogen.is_master: import_policy = self._router.responder.policy
+        else: import_policy = self._router.importer.policy
         return {
             'parent_ids': parent_ids,
             'context_id': self.context.context_id,
             'debug': self.options.debug,
+            'import_blocks': list(import_policy.blocks),
+            'import_overrides': list(import_policy.overrides),
+            'log_levels': get_log_levels(),
             'profiling': self.options.profiling,
             'unidirectional': self.options.unidirectional,
-            'log_level': get_log_level(),
-            'whitelist': self._router.get_module_whitelist(),
-            'blacklist': self._router.get_module_blacklist(),
             'max_message_size': self.options.max_message_size,
             'version': mitogen.__version__,
         }
@@ -1643,6 +1652,9 @@ class Connection(object):
         stream = self.stream_factory()
         stream.conn = self
         stream.name = self.options.name or self._get_name()
+        for fp in self.proc.stdout, self.proc.stdin:
+            fd = fp.fileno()
+            mitogen.core.set_blocking(fd, False)
         stream.accept(self.proc.stdout, self.proc.stdin)
 
         mitogen.core.listen(stream, 'disconnect', self.on_stdio_disconnect)
@@ -1653,6 +1665,8 @@ class Connection(object):
         stream = self.stderr_stream_factory()
         stream.conn = self
         stream.name = self.options.name or self._get_name()
+        fd = self.proc.stderr.fileno()
+        mitogen.core.set_blocking(fd, False)
         stream.accept(self.proc.stderr, self.proc.stderr)
 
         mitogen.core.listen(stream, 'disconnect', self.on_stderr_disconnect)
@@ -1712,7 +1726,7 @@ class ChildIdAllocator(object):
     def __init__(self, router):
         self.router = router
         self.lock = threading.Lock()
-        self.it = iter(xrange(0))
+        self.it = iter(mitogen.core.range(0))
 
     def allocate(self):
         """
@@ -1736,7 +1750,7 @@ class ChildIdAllocator(object):
             start, end = master.send_await(
                 mitogen.core.Message(dst_id=0, handle=mitogen.core.ALLOCATE_ID)
             )
-            self.it = iter(xrange(start, end))
+            self.it = iter(mitogen.core.range(start, end))
         finally:
             self.lock.release()
 
@@ -1985,8 +1999,8 @@ class Context(mitogen.core.Context):
 
     via = None
 
-    def __init__(self, *args, **kwargs):
-        super(Context, self).__init__(*args, **kwargs)
+    def __init__(self, router, context_id, name=None):
+        super(Context, self).__init__(router, context_id, name)
         self.default_call_chain = self.call_chain_class(self)
 
     def __ne__(self, other):
@@ -2297,6 +2311,11 @@ class Router(mitogen.core.Router):
             parent_context=parent,
             importer=importer,
         )
+        self.resource_responder = ResourceForwarder(
+            self,
+            parent,
+            importer._resource_requester,
+        )
         self.route_monitor = RouteMonitor(self, parent)
         self.add_handler(
             fn=self._on_detaching,
@@ -2395,16 +2414,6 @@ class Router(mitogen.core.Router):
         finally:
             self._write_lock.release()
 
-    def get_module_blacklist(self):
-        if mitogen.context_id == 0:
-            return self.responder.blacklist
-        return self.importer.master_blacklist
-
-    def get_module_whitelist(self):
-        if mitogen.context_id == 0:
-            return self.responder.whitelist
-        return self.importer.master_whitelist
-
     def allocate_id(self):
         return self.id_allocator.allocate()
 
@@ -2412,8 +2421,7 @@ class Router(mitogen.core.Router):
 
     def _connect(self, klass, **kwargs):
         context_id = self.allocate_id()
-        context = self.context_class(self, context_id)
-        context.name = kwargs.get('name')
+        context = self.context_class(self, context_id, kwargs.get('name'))
 
         kwargs['old_router'] = self
         kwargs['max_message_size'] = self.max_message_size
@@ -2487,6 +2495,9 @@ class Router(mitogen.core.Router):
     def lxd(self, **kwargs):
         return self.connect(u'lxd', **kwargs)
 
+    def incus(self, **kwargs):
+        return self.connect(u'incus', **kwargs)
+
     def setns(self, **kwargs):
         return self.connect(u'setns', **kwargs)
 
@@ -2555,9 +2566,8 @@ class Reaper(object):
         relatively conservative retries.
         """
         delay = 0.05
-        for _ in xrange(count):
-            delay *= 1.72
-        return delay
+        factor = 1.72
+        return delay * factor ** count
 
     def _on_broker_shutdown(self):
         """
@@ -2783,3 +2793,43 @@ class ModuleForwarder(object):
                     handle=mitogen.core.LOAD_MODULE,
                 )
             )
+
+
+class ResourceForwarder(object):
+    """
+    Handle :data:`mitogen.core.GET_RESOURCE` requests from children by
+    forwarding the request to our parent, or satisfying the request from
+    our local :class:`mitogen.core.ResourceRequester` cache.
+    """
+    def __init__(self, router, parent_context, requester):
+        self.router = router
+        self.parent_context = parent_context
+        self.requester = requester
+        router.add_handler(
+            fn=self._on_get_resource,
+            handle=mitogen.core.GET_RESOURCE,
+            persist=True,
+            policy=is_immediate_child,
+        )
+
+    def _on_get_resource(self, msg):
+        if msg.is_dead:
+            return
+
+        fullname, resource = msg.unpickle()
+        callback = lambda: self._on_cache_callback(msg, fullname, resource)
+        self.requester._request_resource(fullname, resource, callback)
+
+    def _on_cache_callback(self, msg, fullname, resource):
+        stream = self.router.stream_by_id(msg.src_id)
+        self._send_resource(stream, fullname, resource)
+
+    def _send_resource(self, stream, fullname, resource):
+        content = self.requester._cache[(fullname, resource)]
+
+        msg = mitogen.core.Message.pickled(
+            (fullname, resource), content,
+            dst_id=stream.protocol.remote_id,
+            handle=mitogen.core.LOAD_RESOURCE,
+        )
+        self.router._async_route(msg)
